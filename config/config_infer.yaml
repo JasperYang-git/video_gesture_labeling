@@ -1,0 +1,21 @@
+seed: 42
+device: auto
+
+data:
+  processed_dir: data/processed
+  manifest_path: data/processed/splits.json
+  mapping_path: data/mapping.txt
+  split: test
+  input_paths: []
+  window_size: 60
+  stride: 12
+
+inference:
+  model_path: outputs/best_model.pth
+  log_every_video: true
+  save_frame_csv: true
+  save_frame_npy: true
+  save_segments: true
+
+output:
+  root_dir: outputs/inference_results

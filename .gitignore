@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+outputs/
+data/processed/
+data/cache/
+data/users/
+*.pth
+*.onnx
+.DS_Store

@@ -1,0 +1,51 @@
+seed: 42
+device: cpu
+
+data:
+  processed_dir: data/processed
+  manifest_path: data/processed/splits.json
+  mapping_path: data/mapping.txt
+  window_size: 60
+  stride: 12
+  keep_background_prob: 0.2
+  num_workers: 0
+  split: test
+  input_paths: []
+
+model:
+  name: MS_TCN2
+  params:
+    num_layers_PG: 3
+    num_layers_R: 2
+    num_R: 1
+    num_f_maps: 16
+    dim: 128
+    num_classes: 15
+
+training:
+  batch_size: 4
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  num_epochs: 2
+  gradient_clip_norm: 5.0
+  class_weighted_loss: true
+  tmse_weight: 0.1
+  tmse_clamp: 16.0
+
+inference:
+  model_path: outputs/best_model.pth
+  log_every_video: true
+  save_frame_csv: true
+  save_frame_npy: true
+  save_segments: true
+
+evaluation:
+  predictions_dir: null
+  iou_thresholds:
+    - 0.1
+    - 0.25
+    - 0.5
+
+output:
+  root_dir: outputs/training_results
+  latest_model_path: outputs/best_model.pth

@@ -1,0 +1,35 @@
+seed: 42
+device: auto
+
+data:
+  processed_dir: data/processed
+  manifest_path: data/processed/splits.json
+  mapping_path: data/mapping.txt
+  window_size: 60
+  stride: 12
+  keep_background_prob: 0.2
+  num_workers: 0
+
+model:
+  name: MS_TCN2
+  params:
+    num_layers_PG: 6
+    num_layers_R: 4
+    num_R: 3
+    num_f_maps: 64
+    dim: 128
+    num_classes: 15
+
+training:
+  batch_size: 8
+  learning_rate: 0.0005
+  weight_decay: 0.0001
+  num_epochs: 8
+  gradient_clip_norm: 5.0
+  class_weighted_loss: true
+  tmse_weight: 0.1
+  tmse_clamp: 16.0
+
+output:
+  root_dir: outputs/training_results
+  latest_model_path: outputs/best_model.pth

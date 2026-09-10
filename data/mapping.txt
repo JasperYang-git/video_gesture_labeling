@@ -1,0 +1,15 @@
+0 knock
+1 tap
+2 slide-up
+3 slide-down
+4 clench
+5 up-down
+6 wrist
+7 nodded
+8 snap
+9 double-knock
+10 double-tap
+11 double-slide-up
+12 double-slide-down
+13 double-clench
+14 background

@@ -1,0 +1,34 @@
+seed: 42
+
+data:
+  raw_root: data/users/default
+  processed_dir: data/processed
+  manifest_path: data/processed/splits.json
+  mapping_path: data/mapping.txt
+  train_ratio: 0.7
+  validation_ratio: 0.15
+  test_ratio: 0.15
+  overwrite: false
+
+preprocessing:
+  target_fps: 15.0
+  hand_side: R
+  min_detection_confidence: 0.7
+  quality_threshold: 0.6
+  one_euro_min_cutoff: 1.0
+  one_euro_beta: 0.007
+  one_euro_d_cutoff: 1.0
+  cache_dir: data/cache
+
+mock:
+  enabled: true
+  output_dir: data/processed
+  videos_per_split:
+    train: 8
+    validation: 3
+    test: 3
+  min_frames: 180
+  max_frames: 240
+  fps: 15.0
+  miss_rate: 0.08
+  noise_std: 0.04
