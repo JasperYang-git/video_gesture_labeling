@@ -30,6 +30,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Generate mock sequences even if mock.enabled is false",
     )
+    parser.add_argument(
+        "--raw-root",
+        help=(
+            "Training-data root. Overrides data.raw_root and processes real data "
+            "even if mock.enabled is true"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -40,7 +47,14 @@ def main() -> None:
     data_config = config["data"]
     dump_mapping(data_config.get("mapping_path", "data/mapping.txt"))
 
-    use_mock = bool(args.use_mock or config.get("mock", {}).get("enabled", False))
+    raw_root = args.raw_root or data_config["raw_root"]
+    use_mock = bool(
+        args.use_mock
+        or (
+            config.get("mock", {}).get("enabled", False)
+            and args.raw_root is None
+        )
+    )
     processed_dir = Path(data_config["processed_dir"])
     processed_dir.mkdir(parents=True, exist_ok=True)
 
@@ -50,12 +64,15 @@ def main() -> None:
         return
 
     preprocess_config = PreprocessConfig(**config["preprocessing"])
-    items = discover_raw_videos(data_config["raw_root"], preprocess_config.hand_side)
+    items = discover_raw_videos(raw_root, preprocess_config.hand_side)
     if not items:
         raise FileNotFoundError(
-            f"No raw videos found under {data_config['raw_root']}. "
+            f"No sample directories containing both an MP4 and "
+            f"'NOVA project/gestures.annotation~' were found under {raw_root} "
+            f"for hand side {preprocess_config.hand_side}. "
             "Use --use-mock or enable mock.enabled to generate fake data."
         )
+    print(f"Discovered {len(items)} labeled videos under {raw_root}")
     records = process_raw_videos(
         items,
         preprocess_config,

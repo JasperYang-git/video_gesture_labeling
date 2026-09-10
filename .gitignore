@@ -11,3 +11,4 @@ data/users/
 *.pth
 *.onnx
 .DS_Store
+env/

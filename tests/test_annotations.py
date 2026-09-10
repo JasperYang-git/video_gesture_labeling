@@ -11,6 +11,7 @@ from utils.preprocessing.annotations import (
     labels_from_intervals,
     parse_nova_annotation,
 )
+from utils.preprocessing.pipeline import discover_raw_videos
 from utils.schema import BACKGROUND_ID
 
 
@@ -45,6 +46,40 @@ class AnnotationTests(unittest.TestCase):
         self.assertEqual(infer_hand_side_from_folder("12_M_R_session"), "R")
         self.assertEqual(infer_hand_side_from_folder("12_F_L_session"), "L")
         self.assertIsNone(infer_hand_side_from_folder("session"))
+
+    def test_discovers_labeled_videos_below_type_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            valid = root / "sit" / "DG2024062702_F_R_sit"
+            (valid / "NOVA project").mkdir(parents=True)
+            (valid / "recording.mp4").touch()
+            (valid / "NOVA project" / "gestures.annotation~").write_text(
+                "0;1;0;1;\n",
+                encoding="utf-8",
+            )
+
+            missing_video = root / "walk" / "DG2024062702_F_R_walk"
+            (missing_video / "NOVA project").mkdir(parents=True)
+            (missing_video / "NOVA project" / "gestures.annotation~").touch()
+
+            missing_annotation = root / "tap" / "DG2024062702_F_R_tap"
+            missing_annotation.mkdir(parents=True)
+            (missing_annotation / "recording.mp4").touch()
+
+            wrong_side = root / "sit" / "DG2024062702_F_L_sit"
+            (wrong_side / "NOVA project").mkdir(parents=True)
+            (wrong_side / "recording.mp4").touch()
+            (wrong_side / "NOVA project" / "gestures.annotation~").touch()
+
+            items = discover_raw_videos(root, hand_side="R")
+
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0]["video_id"], "sit__DG2024062702_F_R_sit")
+            self.assertEqual(items[0]["video_path"], valid / "recording.mp4")
+            self.assertEqual(
+                items[0]["annotation_path"],
+                valid / "NOVA project" / "gestures.annotation~",
+            )
 
 
 if __name__ == "__main__":

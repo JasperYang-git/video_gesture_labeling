@@ -49,19 +49,27 @@ def discover_raw_videos(
         raise FileNotFoundError(f"Raw data root does not exist: {root}")
 
     discovered: list[dict[str, Path | str]] = []
-    for folder in sorted(path for path in root.iterdir() if path.is_dir()):
+    video_folders = sorted(
+        {
+            video_path.parent
+            for pattern in ("*.mp4", "*.MP4")
+            for video_path in root.rglob(pattern)
+            if video_path.is_file()
+        }
+    )
+    for folder in video_folders:
         folder_side = infer_hand_side_from_folder(folder.name)
         if hand_side and folder_side not in {None, hand_side.upper()}:
             continue
         videos = sorted(folder.glob("*.mp4")) + sorted(folder.glob("*.MP4"))
-        if not videos:
-            continue
         annotation = _find_annotation(folder)
         if annotation is None:
             continue
+        relative_folder = folder.relative_to(root)
+        video_id = "__".join(relative_folder.parts)
         discovered.append(
             {
-                "video_id": folder.name,
+                "video_id": video_id,
                 "video_path": videos[0],
                 "annotation_path": annotation,
                 "hand_side": folder_side or (hand_side or "R"),
@@ -71,15 +79,8 @@ def discover_raw_videos(
 
 
 def _find_annotation(folder: Path) -> Path | None:
-    candidates = [
-        folder / "NOVA project" / "gestures.annotation~",
-        folder / "gestures.annotation~",
-        *sorted(folder.rglob("gestures.annotation~")),
-    ]
-    for path in candidates:
-        if path.is_file():
-            return path
-    return None
+    path = folder / "NOVA project" / "gestures.annotation~"
+    return path if path.is_file() else None
 
 
 def _cache_path(cache_dir: Path, video_id: str, fingerprint: str) -> Path:
