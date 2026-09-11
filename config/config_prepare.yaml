@@ -18,6 +18,9 @@ split:
   strategy: subject
 
 preprocessing:
+  # Start with 4 on the 72-core shared server. Increase to 7 after one
+  # successful real-data run while CPU and memory remain healthy.
+  num_workers: 4
   target_fps: 15.0
   hand_side: R
   min_detection_confidence: 0.7

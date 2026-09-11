@@ -16,9 +16,10 @@ from utils.preprocessing.features import (
 from utils.preprocessing.pipeline import (
     PreprocessConfig,
     compute_quality_audit,
+    process_raw_videos,
     source_fingerprint,
 )
-from utils.schema import BACKGROUND_ID, COORD_DIM, SequenceRecord
+from utils.schema import BACKGROUND_ID, COORD_DIM, SequenceRecord, save_sequence
 from utils.split import split_grouped_files
 
 
@@ -104,6 +105,39 @@ class PipelineV2Tests(unittest.TestCase):
             annotation.write_text("0;1;1;1;\n", encoding="utf-8")
             second, _, _ = source_fingerprint(PreprocessConfig(), video, annotation)
             self.assertNotEqual(first, second)
+
+    def test_parallel_preprocessing_reuses_valid_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output_dir = root / "processed"
+            config = PreprocessConfig(cache_dir=str(root / "cache"), num_workers=2)
+            items = []
+            for index in range(3):
+                video_id = f"video_{index}"
+                video = root / f"{video_id}.mp4"
+                annotation = root / f"{video_id}.annotation"
+                video.write_bytes(f"video-{index}".encode())
+                annotation.write_text("0;1;0;1;\n", encoding="utf-8")
+                fingerprint, _, _ = source_fingerprint(config, video, annotation)
+                record = make_record(
+                    video_id,
+                    np.zeros(20, dtype=np.int64),
+                )
+                record.metadata["preprocess_fingerprint"] = fingerprint
+                save_sequence(output_dir / f"{video_id}.npz", record)
+                items.append(
+                    {
+                        "video_id": video_id,
+                        "video_path": video,
+                        "annotation_path": annotation,
+                    }
+                )
+            records = process_raw_videos(items, config, output_dir)
+            self.assertEqual([record.video_id for record in records], [
+                "video_0",
+                "video_1",
+                "video_2",
+            ])
 
     def test_subject_split_has_no_cross_split_leakage(self) -> None:
         files = [Path(f"a{i}.npz") for i in range(2)] + [

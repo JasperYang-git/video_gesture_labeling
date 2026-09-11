@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -33,9 +35,14 @@ class PreprocessConfig:
     one_euro_beta: float = 0.007
     one_euro_d_cutoff: float = 1.0
     cache_dir: str = "data/cache"
+    num_workers: int = 1
 
     def fingerprint(self) -> str:
-        payload = json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
+        values = asdict(self)
+        # Runtime scheduling and cache location do not change extracted features.
+        values.pop("num_workers", None)
+        values.pop("cache_dir", None)
+        payload = json.dumps(values, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
@@ -386,9 +393,9 @@ def process_raw_videos(
     output_dir: str | Path,
     overwrite: bool = False,
 ) -> list[SequenceRecord]:
-    records: list[SequenceRecord] = []
-    for item in items:
-        records.append(
+    item_list = list(items)
+    if config.num_workers <= 1 or len(item_list) <= 1:
+        return [
             process_raw_video(
                 video_id=str(item["video_id"]),
                 video_path=item["video_path"],
@@ -397,5 +404,62 @@ def process_raw_videos(
                 output_dir=output_dir,
                 overwrite=overwrite,
             )
+            for item in item_list
+        ]
+
+    worker_count = min(int(config.num_workers), len(item_list))
+    output_paths: list[Path | None] = [None] * len(item_list)
+    failures: list[str] = []
+    context = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(
+        max_workers=worker_count,
+        mp_context=context,
+    ) as executor:
+        futures = {
+            executor.submit(
+                _process_raw_video_worker,
+                index,
+                item,
+                config,
+                str(output_dir),
+                overwrite,
+            ): (index, str(item["video_id"]))
+            for index, item in enumerate(item_list)
+        }
+        for future in as_completed(futures):
+            index, video_id = futures[future]
+            try:
+                _, output_path = future.result()
+            except Exception as exc:
+                failures.append(f"{video_id}: {type(exc).__name__}: {exc}")
+            else:
+                output_paths[index] = Path(output_path)
+                print(f"Completed {video_id} ({sum(path is not None for path in output_paths)}/{len(item_list)})")
+    if failures:
+        details = "\n".join(f"  - {failure}" for failure in failures)
+        raise RuntimeError(
+            f"{len(failures)} of {len(item_list)} videos failed during preprocessing:\n{details}"
         )
-    return records
+    from utils.schema import load_sequence
+
+    return [load_sequence(path) for path in output_paths if path is not None]
+
+
+def _process_raw_video_worker(
+    index: int,
+    item: dict[str, Path | str],
+    config: PreprocessConfig,
+    output_dir: str,
+    overwrite: bool,
+) -> tuple[int, str]:
+    """Spawn-safe worker that returns only a path, not large feature arrays."""
+    video_id = str(item["video_id"])
+    process_raw_video(
+        video_id=video_id,
+        video_path=item["video_path"],
+        annotation_path=item.get("annotation_path"),
+        config=config,
+        output_dir=output_dir,
+        overwrite=overwrite,
+    )
+    return index, str(Path(output_dir) / f"{video_id}.npz")
