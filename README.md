@@ -8,7 +8,7 @@
 
 - 任务：Temporal Action Segmentation，整段视频离线预测
 - 模型：MS-TCN2（Prediction Generation + Refinement）
-- 特征：128 维 `score + v_mask + 63 坐标 + 63 速度`
+- 特征：128 维 `tracking_quality + v_mask + 63 坐标 + 63 速度`
 - 评估：完整视频级 frame accuracy、Edit、F1@0.1/0.25/0.5
 
 动作类别见 [`data/mapping.txt`](data/mapping.txt)。
@@ -34,7 +34,9 @@ tests/
 - `valid_mask[T]`
 - `video_id` / `fps` / schema 元数据
 
-训练、验证、测试按原始视频划分，避免重叠窗口泄漏。
+训练数据按动作片段动态生成窗口：每个 epoch 改变动作在窗口中的位置，默认不加入
+纯背景窗口。验证和推理使用固定重叠窗口并融合为完整视频时间轴，最佳 checkpoint
+按整视频 F1@0.5 选择。
 
 ## 模拟数据闭环
 
@@ -78,9 +80,31 @@ python prepare_data.py --config config/config_prepare.yaml
 python train_script.py --config config/config_train.yaml
 ```
 
-真实路径依赖 `opencv-python` 和 `mediapipe`。预处理缓存带配置指纹，改 FPS、平滑参数或左右手后不会静默复用旧缓存。
+真实路径依赖 `opencv-python` 和 `mediapipe`。预处理顺序为：原始 FPS 提取与腕点
+中心化、One-Euro 平滑、目标 FPS 时间桶聚合、palm 中位数归一化、速度计算。程序
+同时生成 `data/processed/quality_audit_report.csv`，记录动作区间和分类别检测质量。
 
 左右手按文件夹名第 3 段和 MediaPipe handedness 同时过滤，不再只取置信度最高的手。
+
+## Manifest、Fingerprint 与用户划分
+
+- **Manifest**（`data/processed/splits.json`）是数据目录，记录每个 NPZ 属于哪个 split，
+  以及 `video_id`、`subject_id`、`session_id`、质量状态和预处理版本。
+- **Fingerprint** 是预处理配方与源数据的指纹。配置、视频大小/修改时间或标注内容
+  变化时都会失效并自动重算，避免误用旧缓存。
+- **Subject/session** 分别表示用户和一次采集批次。真实测试目标是未见用户，因此
+  `split.strategy` 默认是 `subject`，同一用户绝不会跨 train/validation/test。
+
+当前目录名不能可靠提供 subject。复制
+[`data/subject_mapping.example.csv`](data/subject_mapping.example.csv) 为
+`data/subject_mapping.csv` 并填写真实映射。若缺失，prepare 会生成
+`data/processed/missing_subject_mapping.csv` 后停止，不会把视频级结果误称为新用户
+泛化。确实只能做视频级实验时，必须显式设置：
+
+```yaml
+split:
+  strategy: video
+```
 
 ## 输出
 
@@ -88,7 +112,8 @@ python train_script.py --config config/config_train.yaml
 - 推理：每个视频的 `frames.csv`、`prediction.npy`、`segments.json`
 - 评估：`outputs/evaluation_results/.../metrics.json`
 
-Checkpoint 自带模型名、参数、类别映射和特征 schema，推理不需要再声明模型结构。
+Checkpoint 自带模型名、参数、类别映射、manifest hash、视频列表、整视频验证指标和
+预处理 schema/fingerprint。输入数据和训练配方不兼容时，推理会明确报错。
 
 ## 测试
 
@@ -96,4 +121,6 @@ Checkpoint 自带模型名、参数、类别映射和特征 schema，推理不�
 python -m unittest discover -s tests -v
 ```
 
-单元测试覆盖标注解析、视频级划分、窗口掩码、模型形状、损失、重叠拼接和指标。MediaPipe 检出质量与真实时间对齐只有在拿到可运行的加密数据后才能验证。
+单元测试覆盖标注解析、稳健聚合、缓存失效、用户级划分、动态窗口、窗口掩码、模型
+形状、损失、重叠拼接和指标。MediaPipe 检出质量与真实时间对齐只有在拿到可运行的
+加密数据后才能验证。

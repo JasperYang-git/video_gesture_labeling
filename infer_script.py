@@ -9,6 +9,7 @@ from utils.config import load_config
 from utils.inference import (
     load_checkpoint_model,
     predict_sequence,
+    validate_record_compatibility,
     write_prediction_outputs,
 )
 from utils.logger import create_run_directory, setup_logger
@@ -73,6 +74,7 @@ def main() -> None:
     index_payload = []
     for path in files:
         record = load_sequence(path)
+        validate_record_compatibility(record, checkpoint)
         prediction, logits = predict_sequence(
             model,
             record,

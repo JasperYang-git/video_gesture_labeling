@@ -11,6 +11,9 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from utils.schema import IGNORE_INDEX, NUM_CLASSES
+from utils.inference import predict_sequence
+from utils.metrics import aggregate_metrics, evaluate_sequence
+from utils.schema import SequenceRecord
 
 
 def seed_everything(seed: int) -> None:
@@ -173,6 +176,30 @@ def evaluate(
         if class_total[class_id] > 0
     }
     return total_loss / max(total, 1), correct / max(total, 1), class_accuracy
+
+
+@torch.no_grad()
+def evaluate_full_videos(
+    model: nn.Module,
+    records: list[SequenceRecord],
+    device: torch.device,
+    window_size: int,
+    stride: int,
+    iou_thresholds: tuple[float, ...] = (0.1, 0.25, 0.5),
+) -> tuple[dict[str, float], list[dict[str, float | str]]]:
+    model.eval()
+    per_video: list[dict[str, float | str]] = []
+    numeric: list[dict[str, float]] = []
+    for record in records:
+        if record.labels is None:
+            raise ValueError(f"{record.video_id}: labels are required for validation")
+        prediction, _ = predict_sequence(
+            model, record, device, window_size=window_size, stride=stride
+        )
+        metrics = evaluate_sequence(prediction, record.labels, iou_thresholds)
+        numeric.append(metrics)
+        per_video.append({"video_id": record.video_id, **metrics})
+    return aggregate_metrics(numeric), per_video
 
 
 def save_checkpoint(path: Path, payload: dict[str, Any]) -> Path:

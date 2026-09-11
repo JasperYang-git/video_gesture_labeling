@@ -1,0 +1,4 @@
+video_id,subject_id,session_id
+example_video_01,subject_01,subject_01_session_01
+example_video_02,subject_01,subject_01_session_02
+example_video_03,subject_02,subject_02_session_01

@@ -7,7 +7,9 @@ data:
   mapping_path: data/mapping.txt
   window_size: 60
   stride: 12
-  keep_background_prob: 0.2
+  keep_background_prob: 0.0
+  dynamic_action_windows: true
+  action_windows_per_segment: 2
   num_workers: 0
   split: test
   input_paths: []
@@ -31,6 +33,11 @@ training:
   class_weighted_loss: true
   tmse_weight: 0.1
   tmse_clamp: 16.0
+
+validation:
+  checkpoint_metric: f1@0.5
+  stride: 30
+  iou_thresholds: [0.1, 0.25, 0.5]
 
 inference:
   model_path: outputs/best_model.pth

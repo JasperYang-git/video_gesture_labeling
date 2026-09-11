@@ -28,7 +28,15 @@ def load_checkpoint_model(
         checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     except TypeError:
         checkpoint = torch.load(model_path, map_location=device)
-    required = {"model_state_dict", "model_name", "model_config", "feature_dim", "num_classes"}
+    required = {
+        "model_state_dict",
+        "model_name",
+        "model_config",
+        "feature_dim",
+        "num_classes",
+        "schema_version",
+        "preprocess_fingerprints",
+    }
     missing = required.difference(checkpoint)
     if missing:
         raise ValueError(f"Checkpoint is missing keys: {sorted(missing)}")
@@ -36,11 +44,35 @@ def load_checkpoint_model(
         raise ValueError(
             f"Checkpoint feature_dim {checkpoint['feature_dim']} != schema {FEATURE_DIM}"
         )
+    if str(checkpoint["schema_version"]) != SCHEMA_VERSION:
+        raise ValueError(
+            f"Checkpoint schema {checkpoint['schema_version']} != current {SCHEMA_VERSION}"
+        )
     model = build_model(str(checkpoint["model_name"]), checkpoint["model_config"])
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
     model.eval()
     return model, checkpoint
+
+
+def validate_record_compatibility(
+    record: SequenceRecord,
+    checkpoint: dict[str, Any],
+) -> None:
+    fingerprint = str(
+        record.metadata.get(
+            "preprocess_config_fingerprint",
+            record.metadata.get("preprocess_fingerprint", ""),
+        )
+    )
+    allowed = {str(item) for item in checkpoint.get("preprocess_fingerprints", [])}
+    if not fingerprint:
+        raise ValueError(f"{record.video_id}: sequence has no preprocess fingerprint")
+    if fingerprint not in allowed:
+        raise ValueError(
+            f"{record.video_id}: preprocessing fingerprint '{fingerprint}' is not "
+            f"compatible with checkpoint fingerprints {sorted(allowed)}"
+        )
 
 
 def overlap_window_starts(num_frames: int, window_size: int, stride: int) -> list[int]:

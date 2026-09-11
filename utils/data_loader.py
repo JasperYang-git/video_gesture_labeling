@@ -38,6 +38,8 @@ class GestureWindowDataset(Dataset):
         keep_background_probability: float | None = None,
         seed: int = 42,
         require_labels: bool = True,
+        dynamic_action_windows: bool = False,
+        action_windows_per_segment: int = 3,
     ) -> None:
         if window_size <= 0 or stride <= 0:
             raise ValueError("window_size and stride must be positive")
@@ -50,24 +52,46 @@ class GestureWindowDataset(Dataset):
 
         self.window_size = window_size
         self.stride = stride
+        self.keep_background_prob = keep_background_prob
+        self.seed = seed
+        self.dynamic_action_windows = dynamic_action_windows
+        self.action_windows_per_segment = max(1, int(action_windows_per_segment))
         self.records = list(records)
         self.record_by_id = {record.video_id: record for record in self.records}
-        rng = np.random.default_rng(seed)
         self.windows: list[WindowSample] = []
         for record in self.records:
             if require_labels and record.labels is None:
                 raise ValueError(f"{record.video_id}: labels are required for training")
-            self.windows.extend(
-                _windows_for_record(
-                    record,
-                    window_size,
-                    stride,
-                    keep_background_prob,
-                    rng,
-                )
-            )
+        self.set_epoch(0)
         if not self.windows:
             raise ValueError("No training windows were generated")
+
+    def set_epoch(self, epoch: int) -> None:
+        rng = np.random.default_rng(self.seed + int(epoch))
+        windows: list[WindowSample] = []
+        for record in self.records:
+            if self.dynamic_action_windows and record.labels is not None:
+                windows.extend(
+                    _dynamic_action_windows_for_record(
+                        record,
+                        self.window_size,
+                        self.action_windows_per_segment,
+                        self.keep_background_prob,
+                        self.stride,
+                        rng,
+                    )
+                )
+            else:
+                windows.extend(
+                    _windows_for_record(
+                        record,
+                        self.window_size,
+                        self.stride,
+                        self.keep_background_prob,
+                        rng,
+                    )
+                )
+        self.windows = windows
 
     def __len__(self) -> int:
         return len(self.windows)
@@ -135,6 +159,66 @@ def _windows_for_record(
     return windows
 
 
+def _action_segments(labels: np.ndarray) -> list[tuple[int, int]]:
+    segments: list[tuple[int, int]] = []
+    start: int | None = None
+    for index, label in enumerate(labels.tolist()):
+        if label != BACKGROUND_ID and start is None:
+            start = index
+        if start is not None and (
+            label == BACKGROUND_ID
+            or (index > start and labels[index - 1] != label)
+        ):
+            segments.append((start, index))
+            start = index if label != BACKGROUND_ID else None
+    if start is not None:
+        segments.append((start, len(labels)))
+    return segments
+
+
+def _dynamic_action_windows_for_record(
+    record: SequenceRecord,
+    window_size: int,
+    samples_per_segment: int,
+    keep_background_prob: float,
+    stride: int,
+    rng: np.random.Generator,
+) -> list[WindowSample]:
+    assert record.labels is not None
+    max_start = max(record.num_frames - window_size, 0)
+    selected: set[int] = set()
+    for segment_start, segment_end in _action_segments(record.labels):
+        low = max(0, segment_end - window_size)
+        high = min(segment_start, max_start)
+        if high < low:
+            center = min(max((segment_start + segment_end - window_size) // 2, 0), max_start)
+            selected.add(center)
+            continue
+        anchors = np.linspace(low, high, samples_per_segment)
+        jitter = max(1, stride // 2)
+        for anchor in anchors:
+            start = int(round(anchor)) + int(rng.integers(-jitter, jitter + 1))
+            selected.add(min(max(start, low), high))
+
+    windows = [
+        WindowSample(
+            video_id=record.video_id,
+            start=start,
+            end=min(start + window_size, record.num_frames),
+            is_background=False,
+        )
+        for start in sorted(selected)
+    ]
+    if keep_background_prob > 0:
+        existing = {window.start for window in windows}
+        for candidate in _windows_for_record(
+            record, window_size, stride, keep_background_prob, rng
+        ):
+            if candidate.is_background and candidate.start not in existing:
+                windows.append(candidate)
+    return sorted(windows, key=lambda item: item.start)
+
+
 def _slice_window(
     record: SequenceRecord,
     start: int,
@@ -194,6 +278,10 @@ def build_train_loaders(config: dict) -> tuple[DataLoader, DataLoader, list[Path
     train_dataset = GestureWindowDataset(
         train_records,
         keep_background_prob=float(data_config.get("keep_background_prob", 0.0)),
+        dynamic_action_windows=bool(data_config.get("dynamic_action_windows", True)),
+        action_windows_per_segment=int(
+            data_config.get("action_windows_per_segment", 3)
+        ),
         **dataset_kwargs,
     )
     validation_dataset = GestureWindowDataset(

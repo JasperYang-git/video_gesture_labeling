@@ -29,7 +29,7 @@ NUM_CLASSES = len(CLASS_NAMES)
 COORD_DIM = 63
 VELOCITY_DIM = 63
 FEATURE_DIM = 2 + COORD_DIM + VELOCITY_DIM
-SCHEMA_VERSION = "gesture_sequence_v1"
+SCHEMA_VERSION = "gesture_sequence_v2"
 IGNORE_INDEX = -100
 SCORE_INDEX = 0
 VALID_MASK_INDEX = 1
@@ -38,7 +38,7 @@ VELOCITY_SLICE = slice(2 + COORD_DIM, FEATURE_DIM)
 
 
 def feature_names() -> list[str]:
-    names = ["score", "v_mask"]
+    names = ["tracking_quality", "v_mask"]
     names.extend(f"c_{index}" for index in range(COORD_DIM))
     names.extend(f"v_{index}" for index in range(VELOCITY_DIM))
     return names
@@ -84,6 +84,8 @@ class SequenceRecord:
     fps: float
     source_path: str = ""
     hand_side: str = "R"
+    subject_id: str = ""
+    session_id: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -117,6 +119,8 @@ class SequenceRecord:
             "fps": np.asarray(self.fps, dtype=np.float32),
             "source_path": np.asarray(self.source_path),
             "hand_side": np.asarray(self.hand_side),
+            "subject_id": np.asarray(self.subject_id),
+            "session_id": np.asarray(self.session_id),
             "schema_version": np.asarray(SCHEMA_VERSION),
             "feature_names": np.asarray(FEATURE_NAMES),
             "class_names": np.asarray(CLASS_NAMES),
@@ -131,7 +135,9 @@ class SequenceRecord:
 def save_sequence(path: str | Path, record: SequenceRecord) -> Path:
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(output_path, **record.to_npz_payload())
+    temporary = output_path.with_name(f".{output_path.name}.tmp.npz")
+    np.savez_compressed(temporary, **record.to_npz_payload())
+    temporary.replace(output_path)
     return output_path
 
 
@@ -161,6 +167,8 @@ def load_sequence(path: str | Path) -> SequenceRecord:
         fps=float(archive["fps"]),
         source_path=str(archive["source_path"]) if "source_path" in archive.files else "",
         hand_side=str(archive["hand_side"]) if "hand_side" in archive.files else "R",
+        subject_id=str(archive["subject_id"]) if "subject_id" in archive.files else "",
+        session_id=str(archive["session_id"]) if "session_id" in archive.files else "",
         metadata=metadata,
     )
 
@@ -172,6 +180,8 @@ def sequence_summary(record: SequenceRecord) -> dict[str, Any]:
         "fps": record.fps,
         "feature_dim": int(record.features.shape[0]),
         "hand_side": record.hand_side,
+        "subject_id": record.subject_id,
+        "session_id": record.session_id,
         "has_labels": record.labels is not None,
         "valid_ratio": float(record.valid_mask.mean()) if record.num_frames else 0.0,
     }

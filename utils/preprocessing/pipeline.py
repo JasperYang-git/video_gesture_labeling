@@ -15,13 +15,12 @@ from utils.preprocessing.annotations import (
 )
 from utils.preprocessing.features import (
     OneEuroFilter,
+    aggregate_hand_tracks,
     align_labels_to_target_fps,
     build_feature_matrix,
-    downsample_sequence,
-    landmarks_to_vector,
-    normalize_hand_landmarks,
+    center_hand_landmarks,
 )
-from utils.schema import COORD_DIM, SequenceRecord, save_sequence
+from utils.schema import BACKGROUND_ID, COORD_DIM, NUM_CLASSES, SequenceRecord, save_sequence
 
 
 @dataclass(frozen=True)
@@ -38,6 +37,33 @@ class PreprocessConfig:
     def fingerprint(self) -> str:
         payload = json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def source_fingerprint(
+    config: PreprocessConfig,
+    video_path: str | Path,
+    annotation_path: str | Path | None,
+) -> tuple[str, str, dict[str, int]]:
+    """Fingerprint the recipe, video identity and annotation contents."""
+    video = Path(video_path)
+    stat = video.stat()
+    video_signature = {"size": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)}
+    annotation_sha256 = _file_sha256(annotation_path) if annotation_path else ""
+    payload = {
+        "config": config.fingerprint(),
+        "video": video_signature,
+        "annotation_sha256": annotation_sha256,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16], annotation_sha256, video_signature
 
 
 def discover_raw_videos(
@@ -110,7 +136,7 @@ def _optional_mediapipe():
 def extract_hand_tracks(
     video_path: str | Path,
     config: PreprocessConfig,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
     cv2 = _optional_cv2()
     mp = _optional_mediapipe()
     capture = cv2.VideoCapture(str(video_path))
@@ -123,11 +149,19 @@ def extract_hand_tracks(
 
     desired_side = "Left" if config.hand_side.upper() == "L" else "Right"
     coordinates: list[np.ndarray] = []
-    scores: list[float] = []
+    palm_sizes: list[float] = []
+    tracking_quality: list[float] = []
     valid_mask: list[float] = []
     last_valid = np.zeros(COORD_DIM, dtype=np.float32)
+    last_palm = 1.0
     smoother = OneEuroFilter(
         COORD_DIM,
+        min_cutoff=config.one_euro_min_cutoff,
+        beta=config.one_euro_beta,
+        d_cutoff=config.one_euro_d_cutoff,
+    )
+    palm_smoother = OneEuroFilter(
+        1,
         min_cutoff=config.one_euro_min_cutoff,
         beta=config.one_euro_beta,
         d_cutoff=config.one_euro_d_cutoff,
@@ -149,15 +183,19 @@ def extract_hand_tracks(
             selected = _select_hand(result, desired_side, config.min_detection_confidence)
             if selected is None:
                 coordinates.append(last_valid.copy())
-                scores.append(0.0)
+                palm_sizes.append(last_palm)
+                tracking_quality.append(0.0)
                 valid_mask.append(0.0)
                 continue
-            landmarks, score = selected
-            normalized = normalize_hand_landmarks(landmarks_to_vector(landmarks).reshape(21, 3))
-            smoothed = smoother(normalized, dt)
+            landmarks, quality = selected
+            centered, palm = center_hand_landmarks(landmarks)
+            smoothed = smoother(centered, dt)
+            smoothed_palm = float(palm_smoother(np.asarray([palm], dtype=np.float32), dt)[0])
             last_valid = smoothed
+            last_palm = smoothed_palm
             coordinates.append(smoothed)
-            scores.append(score)
+            palm_sizes.append(smoothed_palm)
+            tracking_quality.append(quality)
             valid_mask.append(1.0)
     capture.release()
 
@@ -165,7 +203,8 @@ def extract_hand_tracks(
         raise ValueError(f"No frames decoded from {video_path}")
     return (
         np.stack(coordinates, axis=0),
-        np.asarray(scores, dtype=np.float32),
+        np.asarray(palm_sizes, dtype=np.float32),
+        np.asarray(tracking_quality, dtype=np.float32),
         np.asarray(valid_mask, dtype=np.float32),
         source_fps,
     )
@@ -197,6 +236,67 @@ def _select_hand(
     return best
 
 
+def compute_quality_audit(
+    centered_coordinates: np.ndarray,
+    palm_sizes: np.ndarray,
+    valid_mask: np.ndarray,
+    labels: np.ndarray | None,
+    fps: float,
+) -> dict[str, Any]:
+    """Compute source-FPS quality metrics, with action-only detection rates."""
+    mask = np.asarray(valid_mask, dtype=np.float32) > 0.5
+    coords = np.asarray(centered_coordinates, dtype=np.float32)
+    palms = np.asarray(palm_sizes, dtype=np.float32)
+    action_mask = np.ones(len(mask), dtype=bool)
+    if labels is not None:
+        action_mask = labels != BACKGROUND_ID
+    detection_rate = float(mask[action_mask].mean()) if action_mask.any() else float(mask.mean())
+
+    per_class: dict[str, float] = {}
+    if labels is not None:
+        for class_id in range(NUM_CLASSES):
+            if class_id == BACKGROUND_ID:
+                continue
+            class_mask = labels == class_id
+            if class_mask.any():
+                per_class[str(class_id)] = float(mask[class_mask].mean())
+    min_class_id = min(per_class, key=per_class.get) if per_class else ""
+    min_class_rate = per_class[min_class_id] if min_class_id else detection_rate
+
+    longest_missing = 0
+    current_missing = 0
+    for is_valid in mask:
+        current_missing = 0 if is_valid else current_missing + 1
+        longest_missing = max(longest_missing, current_missing)
+
+    palm_valid = np.isfinite(palms) & (palms > 1e-3)
+    if palm_valid.any():
+        median_palm = float(np.median(palms[palm_valid]))
+        palm_outlier = np.abs(palms - median_palm) > max(3.0 * median_palm, 1e-3)
+        palm_outlier_rate = float(palm_outlier.mean())
+    else:
+        palm_outlier_rate = 1.0
+
+    if len(coords) > 1:
+        jumps = np.linalg.norm(np.diff(coords, axis=0), axis=1)
+        median_jump = float(np.median(jumps))
+        mad = float(np.median(np.abs(jumps - median_jump)))
+        threshold = median_jump + 6.0 * max(mad, 1e-6)
+        trajectory_jump_rate = float((jumps > threshold).mean())
+    else:
+        trajectory_jump_rate = 0.0
+    return {
+        "detection_rate": detection_rate,
+        "per_class_detection_rate": per_class,
+        "min_class_id": min_class_id,
+        "min_class_detection_rate": float(min_class_rate),
+        "longest_missing_frames": int(longest_missing),
+        "longest_missing_seconds": float(longest_missing / fps),
+        "palm_outlier_rate": palm_outlier_rate,
+        "trajectory_jump_rate": trajectory_jump_rate,
+    }
+
+
 def process_raw_video(
     video_id: str,
     video_path: str | Path,
@@ -205,42 +305,58 @@ def process_raw_video(
     output_dir: str | Path,
     overwrite: bool = False,
 ) -> SequenceRecord:
-    cache_path = _cache_path(Path(config.cache_dir), video_id, config.fingerprint())
+    fingerprint, annotation_sha256, video_signature = source_fingerprint(
+        config, video_path, annotation_path
+    )
+    cache_path = _cache_path(Path(config.cache_dir), video_id, fingerprint)
     output_path = Path(output_dir) / f"{video_id}.npz"
     if output_path.is_file() and not overwrite:
         from utils.schema import load_sequence
 
-        return load_sequence(output_path)
+        try:
+            record = load_sequence(output_path)
+        except (KeyError, ValueError):
+            record = None
+        if record is not None and record.metadata.get("preprocess_fingerprint") == fingerprint:
+            return record
     if cache_path.is_file() and not overwrite:
         from utils.schema import load_sequence
 
-        record = load_sequence(cache_path)
-        save_sequence(output_path, record)
-        return record
+        try:
+            record = load_sequence(cache_path)
+        except (KeyError, ValueError):
+            record = None
+        if record is not None:
+            save_sequence(output_path, record)
+            return record
 
-    coordinates, scores, valid_mask, source_fps = extract_hand_tracks(video_path, config)
+    coordinates, palm_sizes, tracking_quality, valid_mask, source_fps = extract_hand_tracks(
+        video_path, config
+    )
     labels = None
+    source_labels = None
     if annotation_path is not None:
         intervals = parse_nova_annotation(annotation_path)
         source_labels = labels_from_intervals(len(coordinates), source_fps, intervals)
         labels = align_labels_to_target_fps(source_labels, source_fps, config.target_fps)
 
-    coords_ds = downsample_sequence(coordinates, source_fps, config.target_fps)
-    scores_ds = downsample_sequence(scores[:, None], source_fps, config.target_fps)[:, 0]
-    mask_ds = downsample_sequence(valid_mask[:, None], source_fps, config.target_fps)[:, 0]
-    mask_ds = (mask_ds >= 0.5).astype(np.float32)
-    features = build_feature_matrix(coords_ds, scores_ds, mask_ds, config.target_fps)
+    coords_ds, quality_ds, mask_ds = aggregate_hand_tracks(
+        coordinates,
+        palm_sizes,
+        tracking_quality,
+        valid_mask,
+        source_fps,
+        config.target_fps,
+    )
+    features = build_feature_matrix(coords_ds, quality_ds, mask_ds, config.target_fps)
     if labels is not None and labels.shape[0] != features.shape[1]:
         raise ValueError(
             f"{video_id}: label length {labels.shape[0]} != feature length {features.shape[1]}"
         )
 
-    action_mask = np.ones(features.shape[1], dtype=bool)
-    if labels is not None:
-        from utils.schema import BACKGROUND_ID
-
-        action_mask = labels != BACKGROUND_ID
-    detection_rate = float(mask_ds[action_mask].mean()) if action_mask.any() else float(mask_ds.mean())
+    audit = compute_quality_audit(
+        coordinates, palm_sizes, valid_mask, source_labels, source_fps
+    )
     record = SequenceRecord(
         features=features,
         labels=labels,
@@ -251,9 +367,12 @@ def process_raw_video(
         hand_side=config.hand_side,
         metadata={
             "source_fps": source_fps,
-            "detection_rate": detection_rate,
-            "preprocess_fingerprint": config.fingerprint(),
-            "quality_passed": detection_rate >= config.quality_threshold,
+            **audit,
+            "preprocess_fingerprint": fingerprint,
+            "preprocess_config_fingerprint": config.fingerprint(),
+            "annotation_sha256": annotation_sha256,
+            "video_signature": video_signature,
+            "quality_passed": audit["detection_rate"] >= config.quality_threshold,
         },
     )
     save_sequence(cache_path, record)

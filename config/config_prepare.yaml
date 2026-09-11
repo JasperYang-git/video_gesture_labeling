@@ -5,10 +5,17 @@ data:
   processed_dir: data/processed
   manifest_path: data/processed/splits.json
   mapping_path: data/mapping.txt
+  subject_mapping_path: data/subject_mapping.csv
+  missing_subject_report: data/processed/missing_subject_mapping.csv
   train_ratio: 0.7
   validation_ratio: 0.15
   test_ratio: 0.15
   overwrite: false
+
+split:
+  # Use "video" only when subject identities truly are unavailable and the
+  # resulting metrics are explicitly understood as video-level generalisation.
+  strategy: subject
 
 preprocessing:
   target_fps: 15.0

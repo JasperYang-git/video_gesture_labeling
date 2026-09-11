@@ -11,6 +11,7 @@ from utils.schema import (
     COORD_DIM,
     NUM_CLASSES,
     SequenceRecord,
+    load_sequence,
     save_sequence,
 )
 from utils.split import write_manifest
@@ -63,6 +64,8 @@ def generate_mock_sequence(
     seed: int,
     miss_rate: float = 0.08,
     noise_std: float = 0.04,
+    subject_id: str = "",
+    session_id: str = "",
 ) -> SequenceRecord:
     rng = np.random.default_rng(seed)
     time = np.arange(num_frames, dtype=np.float32) / fps
@@ -89,6 +92,17 @@ def generate_mock_sequence(
         else:
             last_valid = coordinates[index]
     features = build_feature_matrix(coordinates, scores, valid_mask, fps)
+    action_mask = labels != BACKGROUND_ID
+    detection_rate = (
+        float(valid_mask[action_mask].mean())
+        if action_mask.any()
+        else float(valid_mask.mean())
+    )
+    per_class_detection_rate = {
+        str(class_id): float(valid_mask[labels == class_id].mean())
+        for class_id in GESTURE_IDS
+        if np.any(labels == class_id)
+    }
     return SequenceRecord(
         features=features,
         labels=labels,
@@ -97,9 +111,25 @@ def generate_mock_sequence(
         fps=fps,
         source_path=f"mock://{video_id}",
         hand_side="R",
+        subject_id=subject_id,
+        session_id=session_id,
         metadata={
             "source": "mock",
             "class_names": list(CLASS_NAMES),
+            "preprocess_fingerprint": "mock_v2_audit",
+            "preprocess_config_fingerprint": "mock_v2_audit",
+            "quality_passed": True,
+            "detection_rate": detection_rate,
+            "per_class_detection_rate": per_class_detection_rate,
+            "min_class_id": min(
+                per_class_detection_rate,
+                key=per_class_detection_rate.get,
+                default="",
+            ),
+            "min_class_detection_rate": min(
+                per_class_detection_rate.values(),
+                default=detection_rate,
+            ),
         },
     )
 
@@ -126,11 +156,22 @@ def generate_mock_dataset(
             rng = np.random.default_rng(seed + file_index)
             num_frames = int(rng.integers(min_frames, max_frames + 1))
             video_id = f"mock_{split_name}_{local_index:02d}"
+            subject_id = f"mock_subject_{split_name}_{local_index // 2:02d}"
+            session_id = f"{subject_id}_session_{local_index % 2:02d}"
             output_path = root / f"{video_id}.npz"
             if output_path.exists() and not overwrite:
-                split_files[split_name].append(output_path)
-                file_index += 1
-                continue
+                try:
+                    existing = load_sequence(output_path)
+                except (ValueError, KeyError):
+                    output_path.unlink()
+                else:
+                    if (
+                        existing.metadata.get("preprocess_config_fingerprint")
+                        == "mock_v2_audit"
+                    ):
+                        split_files[split_name].append(output_path)
+                        file_index += 1
+                        continue
             record = generate_mock_sequence(
                 video_id=video_id,
                 num_frames=num_frames,
@@ -138,6 +179,8 @@ def generate_mock_dataset(
                 seed=seed + file_index,
                 miss_rate=miss_rate,
                 noise_std=noise_std,
+                subject_id=subject_id,
+                session_id=session_id,
             )
             save_sequence(output_path, record)
             split_files[split_name].append(output_path)
@@ -159,6 +202,11 @@ def generate_mock_and_manifest(config: dict) -> Path:
         noise_std=float(mock_config.get("noise_std", 0.04)),
         overwrite=bool(data_config.get("overwrite", False)),
     )
+    records = [
+        load_sequence(path)
+        for split_name in ("train", "validation", "test")
+        for path in split_files[split_name]
+    ]
     return write_manifest(
         data_config["manifest_path"],
         split_files,
@@ -169,4 +217,6 @@ def generate_mock_and_manifest(config: dict) -> Path:
             "test": float(data_config.get("test_ratio", 0.15)),
         },
         processed_dir=mock_config.get("output_dir", data_config["processed_dir"]),
+        records=records,
+        grouping="subject",
     )

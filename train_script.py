@@ -12,9 +12,18 @@ from model import build_model
 from utils.config import load_config
 from utils.data_loader import build_train_loaders
 from utils.logger import create_run_directory, log_class_distribution, setup_logger
-from utils.schema import CLASS_NAMES, FEATURE_DIM, FEATURE_NAMES, NUM_CLASSES, SCHEMA_VERSION
+from utils.schema import (
+    CLASS_NAMES,
+    FEATURE_DIM,
+    FEATURE_NAMES,
+    NUM_CLASSES,
+    SCHEMA_VERSION,
+    load_sequence,
+)
+from utils.split import manifest_sha256
 from utils.trainer import (
     evaluate,
+    evaluate_full_videos,
     make_class_weights,
     resolve_device,
     save_checkpoint,
@@ -88,13 +97,39 @@ def main() -> None:
     )
 
     history: list[dict[str, float]] = []
-    best_accuracy = -1.0
+    best_score = -1.0
+    best_tiebreaker = -1.0
     best_path = run_dir / "best_model.pth"
     last_path = run_dir / "last_model.pth"
     tmse_weight = float(training_config.get("tmse_weight", 0.1))
     tmse_clamp = float(training_config.get("tmse_clamp", 16.0))
+    validation_config = config.get("validation", {})
+    validation_stride = int(
+        validation_config.get("stride", config["data"]["stride"])
+    )
+    iou_thresholds = tuple(
+        float(item)
+        for item in validation_config.get("iou_thresholds", [0.1, 0.25, 0.5])
+    )
+    checkpoint_metric = str(validation_config.get("checkpoint_metric", "f1@0.5"))
+    validation_records = [load_sequence(path) for path in val_files]
+    all_records = [load_sequence(path) for path in train_files + val_files]
+    fingerprints = sorted(
+        {
+            str(
+                record.metadata.get(
+                    "preprocess_config_fingerprint",
+                    record.metadata.get("preprocess_fingerprint", ""),
+                )
+            )
+            for record in all_records
+        }
+    )
+    manifest_hash = manifest_sha256(config["data"]["manifest_path"])
 
     for epoch in range(1, int(training_config["num_epochs"]) + 1):
+        if hasattr(train_loader.dataset, "set_epoch"):
+            train_loader.dataset.set_epoch(epoch)
         train_loss, train_accuracy = train_one_epoch(
             model,
             train_loader,
@@ -113,14 +148,32 @@ def main() -> None:
             tmse_weight,
             tmse_clamp,
         )
+        full_metrics, per_video_metrics = evaluate_full_videos(
+            model,
+            validation_records,
+            device,
+            int(config["data"]["window_size"]),
+            validation_stride,
+            iou_thresholds,
+        )
+        if checkpoint_metric not in full_metrics:
+            raise ValueError(
+                f"Unknown validation checkpoint metric '{checkpoint_metric}'; "
+                f"available: {sorted(full_metrics)}"
+            )
+        selection_score = float(full_metrics[checkpoint_metric])
+        selection_tiebreaker = float(full_metrics["edit"])
         logger.info(
             "Epoch %03d | train_loss=%.6f | train_acc=%.2f%% | "
-            "val_loss=%.6f | val_acc=%.2f%%",
+            "val_loss=%.6f | val_acc=%.2f%% | full_%s=%.4f | edit=%.2f",
             epoch,
             train_loss,
             100.0 * train_accuracy,
             validation_loss,
             100.0 * validation_accuracy,
+            checkpoint_metric,
+            selection_score,
+            full_metrics["edit"],
         )
         history.append(
             {
@@ -129,6 +182,7 @@ def main() -> None:
                 "train_accuracy": train_accuracy,
                 "validation_loss": validation_loss,
                 "validation_accuracy": validation_accuracy,
+                **{f"validation_full_{key}": value for key, value in full_metrics.items()},
             }
         )
 
@@ -144,12 +198,30 @@ def main() -> None:
             "window_size": int(config["data"]["window_size"]),
             "stride": int(config["data"]["stride"]),
             "tmse_weight": tmse_weight,
-            "best_validation_accuracy": max(best_accuracy, validation_accuracy),
+            "manifest_path": str(config["data"]["manifest_path"]),
+            "manifest_sha256": manifest_hash,
+            "split_seed": int(config["seed"]),
+            "train_video_ids": [path.stem for path in train_files],
+            "validation_video_ids": [path.stem for path in val_files],
+            "preprocess_fingerprints": fingerprints,
+            "data_config": config["data"],
+            "validation_config": {
+                "checkpoint_metric": checkpoint_metric,
+                "stride": validation_stride,
+                "iou_thresholds": list(iou_thresholds),
+            },
+            "validation_metrics": full_metrics,
+            "validation_per_video": per_video_metrics,
+            "best_validation_score": max(best_score, selection_score),
+            "selection_tiebreaker": "edit",
             "epoch": epoch,
         }
         save_checkpoint(last_path, checkpoint)
-        if validation_accuracy > best_accuracy:
-            best_accuracy = validation_accuracy
+        if selection_score > best_score or (
+            selection_score == best_score and selection_tiebreaker > best_tiebreaker
+        ):
+            best_score = selection_score
+            best_tiebreaker = selection_tiebreaker
             save_checkpoint(best_path, checkpoint)
             logger.info("Saved new best checkpoint: %s", best_path)
 
@@ -161,8 +233,9 @@ def main() -> None:
     latest_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(best_path, latest_path)
     logger.info(
-        "Training complete. Best validation accuracy=%.2f%%; best_model=%s",
-        100.0 * best_accuracy,
+        "Training complete. Best validation %s=%.4f; best_model=%s",
+        checkpoint_metric,
+        best_score,
         best_path,
     )
 
