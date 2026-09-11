@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Sequence
 
@@ -24,6 +25,7 @@ class WindowSample:
     start: int
     end: int
     is_background: bool
+    window_role: str = "action"
 
 
 class GestureWindowDataset(Dataset):
@@ -40,6 +42,8 @@ class GestureWindowDataset(Dataset):
         require_labels: bool = True,
         dynamic_action_windows: bool = False,
         action_windows_per_segment: int = 3,
+        hard_negative_ratio: float = 0.15,
+        hard_negative_max_windows_per_video: int = 20,
     ) -> None:
         if window_size <= 0 or stride <= 0:
             raise ValueError("window_size and stride must be positive")
@@ -49,6 +53,12 @@ class GestureWindowDataset(Dataset):
             )
         if not 0.0 <= keep_background_prob <= 1.0:
             raise ValueError("keep_background_prob must be in [0, 1]")
+        if hard_negative_ratio < 0.0:
+            raise ValueError("hard_negative_ratio must be non-negative")
+        if hard_negative_max_windows_per_video < 0:
+            raise ValueError(
+                "hard_negative_max_windows_per_video must be non-negative"
+            )
 
         self.window_size = window_size
         self.stride = stride
@@ -56,6 +66,10 @@ class GestureWindowDataset(Dataset):
         self.seed = seed
         self.dynamic_action_windows = dynamic_action_windows
         self.action_windows_per_segment = max(1, int(action_windows_per_segment))
+        self.hard_negative_ratio = float(hard_negative_ratio)
+        self.hard_negative_max_windows_per_video = int(
+            hard_negative_max_windows_per_video
+        )
         self.records = list(records)
         self.record_by_id = {record.video_id: record for record in self.records}
         self.windows: list[WindowSample] = []
@@ -69,7 +83,26 @@ class GestureWindowDataset(Dataset):
     def set_epoch(self, epoch: int) -> None:
         rng = np.random.default_rng(self.seed + int(epoch))
         windows: list[WindowSample] = []
+        hard_negative_candidates: list[WindowSample] = []
         for record in self.records:
+            if self.hard_negative_ratio > 0.0 and _is_hard_negative_record(record):
+                candidates = _windows_for_record(
+                    record,
+                    self.window_size,
+                    self.stride,
+                    keep_background_prob=1.0,
+                    rng=rng,
+                    background_role="hard_negative",
+                )
+                if len(candidates) > self.hard_negative_max_windows_per_video:
+                    selected = rng.choice(
+                        len(candidates),
+                        size=self.hard_negative_max_windows_per_video,
+                        replace=False,
+                    )
+                    candidates = [candidates[index] for index in sorted(selected)]
+                hard_negative_candidates.extend(candidates)
+                continue
             if self.dynamic_action_windows and record.labels is not None:
                 windows.extend(
                     _dynamic_action_windows_for_record(
@@ -91,6 +124,24 @@ class GestureWindowDataset(Dataset):
                         rng,
                     )
                 )
+        action_window_count = sum(
+            window.window_role == "action" for window in windows
+        )
+        hard_negative_count = _hard_negative_target_count(
+            action_window_count,
+            len(hard_negative_candidates),
+            self.hard_negative_ratio,
+        )
+        if hard_negative_count < len(hard_negative_candidates):
+            selected = rng.choice(
+                len(hard_negative_candidates),
+                size=hard_negative_count,
+                replace=False,
+            )
+            hard_negative_candidates = [
+                hard_negative_candidates[index] for index in sorted(selected)
+            ]
+        windows.extend(hard_negative_candidates)
         self.windows = windows
 
     def __len__(self) -> int:
@@ -110,6 +161,7 @@ class GestureWindowDataset(Dataset):
             "valid_mask": torch.from_numpy(valid_mask),
             "video_id": record.video_id,
             "start": sample.start,
+            "window_role": sample.window_role,
         }
 
     @property
@@ -130,6 +182,7 @@ def _windows_for_record(
     stride: int,
     keep_background_prob: float,
     rng: np.random.Generator,
+    background_role: str = "background",
 ) -> list[WindowSample]:
     frames = record.num_frames
     if frames <= 0:
@@ -154,9 +207,32 @@ def _windows_for_record(
                 start=start,
                 end=end,
                 is_background=is_background,
+                window_role=background_role if is_background else "action",
             )
         )
     return windows
+
+
+def _is_hard_negative_record(record: SequenceRecord) -> bool:
+    if record.labels is None or not bool(np.all(record.labels == BACKGROUND_ID)):
+        return False
+    polarity = str(record.metadata.get("polarity", "")).strip().lower()
+    eligible = record.metadata.get("hard_negative_eligible", False)
+    if isinstance(eligible, str):
+        eligible = eligible.strip().lower() in {"1", "true", "yes", "y"}
+    return polarity == "negative" and bool(eligible)
+
+
+def _hard_negative_target_count(
+    action_window_count: int,
+    candidate_count: int,
+    ratio: float,
+) -> int:
+    if candidate_count <= 0 or ratio <= 0.0:
+        return 0
+    if action_window_count <= 0:
+        return min(1, candidate_count)
+    return min(candidate_count, max(1, math.ceil(action_window_count * ratio)))
 
 
 def _action_segments(labels: np.ndarray) -> list[tuple[int, int]]:
@@ -206,6 +282,7 @@ def _dynamic_action_windows_for_record(
             start=start,
             end=min(start + window_size, record.num_frames),
             is_background=False,
+            window_role="action",
         )
         for start in sorted(selected)
     ]
@@ -255,6 +332,7 @@ def collate_windows(
         "valid_mask": torch.stack([item["valid_mask"] for item in batch], dim=0),
         "video_id": [str(item["video_id"]) for item in batch],
         "start": [int(item["start"]) for item in batch],
+        "window_role": [str(item["window_role"]) for item in batch],
     }
 
 
@@ -282,11 +360,16 @@ def build_train_loaders(config: dict) -> tuple[DataLoader, DataLoader, list[Path
         action_windows_per_segment=int(
             data_config.get("action_windows_per_segment", 3)
         ),
+        hard_negative_ratio=float(data_config.get("hard_negative_ratio", 0.15)),
+        hard_negative_max_windows_per_video=int(
+            data_config.get("hard_negative_max_windows_per_video", 20)
+        ),
         **dataset_kwargs,
     )
     validation_dataset = GestureWindowDataset(
         validation_records,
         keep_background_prob=1.0,
+        hard_negative_ratio=0.0,
         **dataset_kwargs,
     )
     loader_kwargs = {

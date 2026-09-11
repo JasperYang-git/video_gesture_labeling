@@ -42,69 +42,84 @@ tests/
 
 ```bash
 python -m pip install -r requirements.txt
-python prepare_data.py --config config/config_prepare.yaml --use-mock
+python prepare_data.py mock --config config/config_prepare.yaml
 python train_script.py --config config/config_smoke.yaml
-python infer_script.py --config config/config_infer.yaml
-python evaluate_script.py --config config/config_eval.yaml
+python infer_script.py --config config/config_mock_infer.yaml
+python evaluate_script.py --config config/config_mock_eval.yaml
 ```
 
-`config/config_prepare.yaml` 默认 `mock.enabled: true`。这只用于通路验证，不要把模拟指标当成真实性能。
+模拟数据只用于通路验证，不要把模拟指标当成真实性能。
 
 完整训练配置在 `config/config_train.yaml`。
 
-## 真实视频
+## 大规模真实数据准备
 
-将数据放到 `data/users/default/<ID>_<Sex>_R_...>/`：
-
-```text
-video.mp4
-NOVA project/gestures.annotation~
-```
-
-标注格式：
+服务器目录：
 
 ```text
-time_begin;time_end;gesture_label;confidence;
+~/video_dataset/
+├── data_lm/
+├── data_ln_once/
+├── data_ln_twice/
+├── data_sr/
+└── data_vj/
 ```
 
-时间为秒，`label=-1` 视为 background。然后：
+每个样本目录命名为：
 
-```yaml
-# config/config_prepare.yaml
-mock:
-  enabled: false
+```text
+<subject_id>_<gender>_<field3>_<scene>_<ignored...>
 ```
+
+其中第一个字段是全局 subject，第 3 个字段不是左右手，第 4 个字段是完整场景名。
+场景必须在 `config/scene_taxonomy.yaml` 中 exact 命中；未注册组合名（例如
+`stand-alarm-strong`）标记为 unknown，默认不提取、不训练。
+
+数据准备分为五个可独立重跑的阶段：
 
 ```bash
-python prepare_data.py --config config/config_prepare.yaml
-python train_script.py --config config/config_train.yaml
+# 1. 只扫描目录、命名、标注和场景，不运行 MediaPipe
+python prepare_data.py inventory
+
+# 2. 每类抽一条，输出物理右手关键点叠图，必须人工检查
+python prepare_data.py preview --limit 1
+
+# 3. 每类先抽 20 条，4 workers 验证稳定性
+python prepare_data.py extract --limit 20 --workers 4
+python prepare_data.py assemble --limit 20
+python prepare_data.py audit --limit 20
+
+# 4. 稳定后全量；中断后执行同一命令会跳过有效缓存
+python prepare_data.py extract --workers 7
+python prepare_data.py assemble
+python prepare_data.py audit
+
+# 5. 划分方案确定后才生成实验 manifest
+python prepare_data.py manifest
 ```
 
-真实路径依赖 `opencv-python` 和 `mediapipe`。预处理顺序为：原始 FPS 提取与腕点
-中心化、One-Euro 平滑、目标 FPS 时间桶聚合、palm 中位数归一化、速度计算。程序
-同时生成 `data/processed/quality_audit_report.csv`，记录动作区间和分类别检测质量。
+可以用 `--sources data_lm data_sr data_vj` 只处理部分 source。`all` 默认运行
+inventory、extract、assemble、audit，但不会自动生成 manifest。
 
-左右手按文件夹名第 3 段和 MediaPipe handedness 同时过滤，不再只取置信度最高的手。
+真实路径依赖 `opencv-python` 和 `mediapipe`。昂贵的 MediaPipe 原始轨迹保存在
+`data/cache/tracks/`；平滑、目标 FPS、palm 归一化、标签对齐和质量阈值在后续阶段，
+修改这些参数不需要重新运行 MediaPipe。
+
+视频不是镜像输入。根据 MediaPipe 的自拍镜像约定，物理右手对应输出标签 `Left`。
+程序只接受该候选，低置信度或只检测到物理左手时记录 `v_mask=0`，绝不回退到左手。
 
 ## Manifest、Fingerprint 与用户划分
 
-- **Manifest**（`data/processed/splits.json`）是数据目录，记录每个 NPZ 属于哪个 split，
-  以及 `video_id`、`subject_id`、`session_id`、质量状态和预处理版本。
+- **Inventory**（`data/inventory/inventory.jsonl`）记录磁盘上发现的全部样本。
+- **Manifest**（`data/manifests/*.json`）记录某次实验使用哪些 source/scene/polarity
+  及其 train/validation/test。
 - **Fingerprint** 是预处理配方与源数据的指纹。配置、视频大小/修改时间或标注内容
   变化时都会失效并自动重算，避免误用旧缓存。
-- **Subject/session** 分别表示用户和一次采集批次。真实测试目标是未见用户，因此
-  `split.strategy` 默认是 `subject`，同一用户绝不会跨 train/validation/test。
+- **Subject** 取完整第一个命名字段（例如 `LMVibra006`）。全局
+  `data/manifests/subject_splits.json` 保证同一对象在五个 source 中不会跨 split。
 
-当前目录名不能可靠提供 subject。复制
-[`data/subject_mapping.example.csv`](data/subject_mapping.example.csv) 为
-`data/subject_mapping.csv` 并填写真实映射。若缺失，prepare 会生成
-`data/processed/missing_subject_mapping.csv` 后停止，不会把视频级结果误称为新用户
-泛化。确实只能做视频级实验时，必须显式设置：
-
-```yaml
-split:
-  strategy: video
-```
+正向视频只采含动作窗口，普通纯背景仍丢弃；taxonomy 中的负向视频必须是全
+background，并作为受控 hard negative 采样，默认约占动作窗口数量的 15%。
 
 ## 输出
 

@@ -1,227 +1,310 @@
+"""Stage-based data preparation for large gesture-video collections."""
+
 from __future__ import annotations
 
 import argparse
-import csv
 import json
+from collections import Counter, defaultdict
+from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 from utils.config import load_config
 from utils.mock_data import generate_mock_and_manifest
-from utils.preprocessing.pipeline import (
-    PreprocessConfig,
-    discover_raw_videos,
-    process_raw_videos,
+from utils.preprocessing.assemble import (
+    AssembleConfig,
+    assemble_inventory,
 )
-from utils.schema import dump_mapping
-from utils.schema import SequenceRecord, load_sequence, save_sequence
-from utils.split import (
-    load_manifest,
-    split_grouped_files,
-    split_video_files,
-    write_manifest,
+from utils.preprocessing.audit import AuditConfig, audit_inventory
+from utils.preprocessing.inventory import (
+    InventoryEntry,
+    read_inventory_jsonl,
+    scan_inventory,
+    write_inventory_csv,
+    write_inventory_jsonl,
+    write_summary_json,
+)
+from utils.preprocessing.manifest import (
+    ManifestConfig,
+    build_experiment_manifest,
+)
+from utils.preprocessing.status import status_summary, write_status_jsonl
+from utils.preprocessing.tracks import (
+    TrackConfig,
+    extract_inventory,
+    write_handedness_previews,
 )
 from utils.trainer import seed_everything
 
 
+STAGES = ("inventory", "preview", "extract", "assemble", "audit", "manifest", "all", "mock")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Prepare gesture sequences from mock data or raw videos.",
+        description=__doc__,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    parser.add_argument("stage", nargs="?", choices=STAGES, default="all")
+    parser.add_argument("--config", default="config/config_prepare.yaml")
+    parser.add_argument("--raw-root", help="Override inventory.raw_root")
     parser.add_argument(
-        "--config",
-        default="config/config_prepare.yaml",
-        help="Path to the data-preparation YAML",
+        "--sources",
+        nargs="+",
+        help="Only process these source directories",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Pilot limit per source, applied after deterministic sorting",
+    )
+    parser.add_argument("--workers", type=int, help="Override extract.num_workers")
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Ignore matching track/sequence cache entries",
+    )
+    parser.add_argument(
+        "--overwrite-subject-splits",
+        action="store_true",
+        help="Explicitly regenerate the global subject split registry",
     )
     parser.add_argument(
         "--use-mock",
         action="store_true",
-        help="Generate mock sequences even if mock.enabled is false",
-    )
-    parser.add_argument(
-        "--raw-root",
-        help=(
-            "Training-data root. Overrides data.raw_root and processes real data "
-            "even if mock.enabled is true"
-        ),
+        help="Compatibility alias for the mock stage",
     )
     return parser.parse_args()
 
 
-def _load_identity_mapping(path: str | Path) -> dict[str, tuple[str, str]]:
-    mapping_path = Path(path)
-    if not mapping_path.is_file():
-        return {}
-    mapping: dict[str, tuple[str, str]] = {}
-    with mapping_path.open("r", encoding="utf-8", newline="") as stream:
-        for row in csv.DictReader(stream):
-            video_id = str(row.get("video_id", "")).strip()
-            if video_id:
-                mapping[video_id] = (
-                    str(row.get("subject_id", "")).strip(),
-                    str(row.get("session_id", "")).strip(),
-                )
-    return mapping
+def _inventory_settings(config: dict[str, Any], args: argparse.Namespace):
+    section = config["inventory"]
+    raw_root = args.raw_root or section["raw_root"]
+    sources = args.sources or list(section["sources"])
+    return section, raw_root, sources
 
 
-def _write_missing_subjects(path: str | Path, records: list[SequenceRecord]) -> Path:
-    output = Path(path)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("w", encoding="utf-8", newline="") as stream:
-        writer = csv.writer(stream)
-        writer.writerow(["video_id", "subject_id", "session_id"])
-        for record in records:
-            writer.writerow([record.video_id, "", ""])
-    return output
+def _run_inventory(
+    config: dict[str, Any],
+    args: argparse.Namespace,
+) -> list[InventoryEntry]:
+    section, raw_root, sources = _inventory_settings(config, args)
+    entries = scan_inventory(raw_root, sources, section["taxonomy_path"])
+    write_inventory_jsonl(section["output_jsonl"], entries)
+    write_inventory_csv(section["output_csv"], entries)
+    write_summary_json(section["summary_path"], entries)
+    print(
+        f"Inventory: {len(entries)} records; "
+        f"status={dict(Counter(item.status for item in entries))}; "
+        f"polarity={dict(Counter(item.polarity or 'unknown' for item in entries))}"
+    )
+    return entries
 
 
-def _write_quality_report(path: str | Path, records: list[SequenceRecord]) -> Path:
-    output = Path(path)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    fields = [
-        "video_id",
-        "quality_passed",
-        "detection_rate",
-        "min_class_id",
-        "min_class_detection_rate",
-        "longest_missing_seconds",
-        "palm_outlier_rate",
-        "trajectory_jump_rate",
-        "per_class_detection_rate",
+def _load_inventory(config: dict[str, Any]) -> list[InventoryEntry]:
+    path = Path(config["inventory"]["output_jsonl"]).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Inventory not found: {path}. Run `python prepare_data.py inventory` first."
+        )
+    return read_inventory_jsonl(path)
+
+
+def _select_entries(
+    entries: list[InventoryEntry],
+    args: argparse.Namespace,
+    include_unknown: bool,
+) -> list[InventoryEntry]:
+    source_filter = set(args.sources or [])
+    selected = [
+        entry
+        for entry in entries
+        if (not source_filter or entry.source in source_filter)
+        and (include_unknown or entry.polarity in {"positive", "negative"})
     ]
-    with output.open("w", encoding="utf-8", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=fields)
-        writer.writeheader()
-        for record in records:
-            metadata = record.metadata
-            writer.writerow(
-                {
-                    "video_id": record.video_id,
-                    **{
-                        field: metadata.get(field, "")
-                        for field in fields
-                        if field not in {"video_id", "per_class_detection_rate"}
-                    },
-                    "per_class_detection_rate": json.dumps(
-                        metadata.get("per_class_detection_rate", {}),
-                        sort_keys=True,
-                    ),
-                }
+    if args.limit is None:
+        return selected
+    if args.limit <= 0:
+        raise ValueError("--limit must be positive")
+    by_source: dict[str, list[InventoryEntry]] = defaultdict(list)
+    for entry in selected:
+        by_source[entry.source].append(entry)
+    return [
+        entry
+        for source in sorted(by_source)
+        for entry in sorted(by_source[source], key=lambda item: item.video_id)[
+            : args.limit
+        ]
+    ]
+
+
+def _track_config(
+    config: dict[str, Any], args: argparse.Namespace
+) -> TrackConfig:
+    values = dict(config["extract"])
+    for runtime_key in ("status_path", "preview_dir", "preview_count"):
+        values.pop(runtime_key, None)
+    track_config = TrackConfig(**values)
+    if args.workers is not None:
+        track_config = replace(track_config, num_workers=args.workers)
+    return track_config
+
+
+def _run_preview(
+    entries: list[InventoryEntry],
+    config: dict[str, Any],
+    args: argparse.Namespace,
+) -> None:
+    section = config["extract"]
+    track_config = _track_config(config, args)
+    candidates = _select_entries(entries, args, include_unknown=False)
+    if args.limit is None:
+        candidates = candidates[:1]
+    written = []
+    for entry in candidates:
+        if entry.status != "ok":
+            continue
+        written.extend(
+            write_handedness_previews(
+                entry,
+                track_config,
+                section["preview_dir"],
+                int(section.get("preview_count", 6)),
             )
-    return output
+        )
+    print(f"Wrote {len(written)} physical-right preview images")
+
+
+def _run_extract(
+    entries: list[InventoryEntry],
+    config: dict[str, Any],
+    args: argparse.Namespace,
+) -> list[dict[str, Any]]:
+    selected = _select_entries(
+        entries,
+        args,
+        bool(config["inventory"].get("include_unknown_for_extraction", False)),
+    )
+    results = extract_inventory(
+        selected,
+        _track_config(config, args),
+        resume=not args.no_resume,
+    )
+    path = write_status_jsonl(config["extract"]["status_path"], results)
+    print(f"Extract status: {status_summary(results)}; details={path}")
+    return results
+
+
+def _run_assemble(
+    entries: list[InventoryEntry],
+    config: dict[str, Any],
+    args: argparse.Namespace,
+) -> list[dict[str, Any]]:
+    selected = _select_entries(
+        entries,
+        args,
+        bool(config["inventory"].get("include_unknown_for_extraction", False)),
+    )
+    results = assemble_inventory(
+        selected,
+        _track_config(config, args),
+        AssembleConfig(
+            **{
+                key: value
+                for key, value in config["assemble"].items()
+                if key != "status_path"
+            }
+        ),
+        resume=not args.no_resume,
+    )
+    path = write_status_jsonl(config["assemble"]["status_path"], results)
+    print(f"Assemble status: {status_summary(results)}; details={path}")
+    return results
+
+
+def _run_audit(
+    entries: list[InventoryEntry],
+    config: dict[str, Any],
+    args: argparse.Namespace,
+) -> None:
+    selected = _select_entries(entries, args, include_unknown=True)
+    assemble_config = AssembleConfig(
+        **{
+            key: value
+            for key, value in config["assemble"].items()
+            if key != "status_path"
+        }
+    )
+    csv_path, pass_path, rows = audit_inventory(
+        selected,
+        assemble_config,
+        AuditConfig(**config["audit"]),
+    )
+    print(
+        f"Audit: {len(rows)} sequences, "
+        f"{sum(bool(row.get('quality_passed')) for row in rows)} passed; "
+        f"report={csv_path}; pass_list={pass_path}"
+    )
+
+
+def _run_manifest(
+    config: dict[str, Any],
+    args: argparse.Namespace,
+) -> None:
+    values = dict(config["manifest"])
+    values.pop("enabled_in_all", None)
+    if args.sources:
+        values["sources"] = args.sources
+    output = build_experiment_manifest(
+        ManifestConfig.from_dict(values),
+        overwrite_subject_splits=args.overwrite_subject_splits,
+    )
+    print(f"Wrote experiment manifest: {output}")
+
+
+def _run_mock(config: dict[str, Any]) -> None:
+    if "data" not in config:
+        raise ValueError(
+            "Mock compatibility requires a data section in config_prepare.yaml"
+        )
+    print(f"Wrote mock manifest: {generate_mock_and_manifest(config)}")
 
 
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
-    seed_everything(int(config["seed"]))
-    data_config = config["data"]
-    dump_mapping(data_config.get("mapping_path", "data/mapping.txt"))
-
-    raw_root = args.raw_root or data_config["raw_root"]
-    use_mock = bool(
-        args.use_mock
-        or (
-            config.get("mock", {}).get("enabled", False)
-            and args.raw_root is None
-        )
-    )
-    processed_dir = Path(data_config["processed_dir"])
-    processed_dir.mkdir(parents=True, exist_ok=True)
-
-    if use_mock:
-        manifest_path = generate_mock_and_manifest(config)
-        mock_records = [
-            load_sequence(path)
-            for files in load_manifest(manifest_path).values()
-            for path in files
-        ]
-        _write_quality_report(processed_dir / "quality_audit_report.csv", mock_records)
-        print(f"Wrote mock dataset and manifest: {manifest_path}")
+    seed_everything(int(config.get("seed", 42)))
+    if args.use_mock or args.stage == "mock":
+        _run_mock(config)
         return
 
-    preprocess_config = PreprocessConfig(**config["preprocessing"])
-    items = discover_raw_videos(raw_root, preprocess_config.hand_side)
-    if not items:
-        raise FileNotFoundError(
-            f"No sample directories containing both an MP4 and "
-            f"'NOVA project/gestures.annotation~' were found under {raw_root} "
-            f"for hand side {preprocess_config.hand_side}. "
-            "Use --use-mock or enable mock.enabled to generate fake data."
-        )
-    print(f"Discovered {len(items)} labeled videos under {raw_root}")
-    records = process_raw_videos(
-        items,
-        preprocess_config,
-        processed_dir,
-        overwrite=bool(data_config.get("overwrite", False)),
+    if args.stage == "inventory":
+        _run_inventory(config, args)
+        return
+    entries = (
+        _run_inventory(config, args)
+        if args.stage == "all"
+        else _load_inventory(config)
     )
-    _write_quality_report(processed_dir / "quality_audit_report.csv", records)
-    identity_mapping = _load_identity_mapping(
-        data_config.get("subject_mapping_path", "data/subject_mapping.csv")
-    )
-    for record in records:
-        subject_id, session_id = identity_mapping.get(record.video_id, ("", ""))
-        record.subject_id = subject_id
-        record.session_id = session_id
-        save_sequence(processed_dir / f"{record.video_id}.npz", record)
-    kept = [
-        processed_dir / f"{record.video_id}.npz"
-        for record in records
-        if bool(record.metadata.get("quality_passed", False))
-    ]
-    if len(kept) < 3:
-        raise ValueError("Need at least three quality-passed videos to create splits")
-    kept_records = [
-        record for record in records if bool(record.metadata.get("quality_passed", False))
-    ]
-    strategy = str(config.get("split", {}).get("strategy", "subject"))
-    if strategy == "subject":
-        missing = [record for record in kept_records if not record.subject_id]
-        if missing:
-            report = _write_missing_subjects(
-                data_config.get(
-                    "missing_subject_report",
-                    "data/processed/missing_subject_mapping.csv",
-                ),
-                missing,
-            )
-            raise ValueError(
-                "Subject-level split requires subject_id for every video. "
-                f"Fill the generated mapping template: {report}"
-            )
-        split_files = split_grouped_files(
-            kept,
-            {record.video_id: record.subject_id for record in kept_records},
-            float(data_config["train_ratio"]),
-            float(data_config["validation_ratio"]),
-            float(data_config["test_ratio"]),
-            int(config["seed"]),
-        )
-    elif strategy == "video":
-        split_files = split_video_files(
-            kept,
-            float(data_config["train_ratio"]),
-            float(data_config["validation_ratio"]),
-            float(data_config["test_ratio"]),
-            int(config["seed"]),
-        )
+    if args.stage == "preview":
+        _run_preview(entries, config, args)
+    elif args.stage == "extract":
+        _run_extract(entries, config, args)
+    elif args.stage == "assemble":
+        _run_assemble(entries, config, args)
+    elif args.stage == "audit":
+        _run_audit(entries, config, args)
+    elif args.stage == "manifest":
+        _run_manifest(config, args)
+    elif args.stage == "all":
+        _run_extract(entries, config, args)
+        _run_assemble(entries, config, args)
+        _run_audit(entries, config, args)
+        if bool(config["manifest"].get("enabled_in_all", False)):
+            _run_manifest(config, args)
     else:
-        raise ValueError("split.strategy must be 'subject' or 'video'")
-    manifest_path = write_manifest(
-        data_config["manifest_path"],
-        split_files,
-        seed=int(config["seed"]),
-        ratios={
-            "train": float(data_config["train_ratio"]),
-            "validation": float(data_config["validation_ratio"]),
-            "test": float(data_config["test_ratio"]),
-        },
-        processed_dir=processed_dir,
-        records=kept_records,
-        grouping=strategy,
-    )
-    print(f"Processed {len(kept)} videos. Manifest: {manifest_path}")
+        raise ValueError(f"Unsupported stage: {args.stage}")
 
 
 if __name__ == "__main__":

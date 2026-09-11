@@ -2,16 +2,12 @@ seed: 42
 
 data:
   processed_dir: data/processed
-  manifest_path: data/manifests/all5.json
-  mapping_path: data/mapping.txt
+  manifest_path: data/processed/splits.json
   split: test
 
 evaluation:
   predictions_dir: null
-  iou_thresholds:
-    - 0.1
-    - 0.25
-    - 0.5
+  iou_thresholds: [0.1, 0.25, 0.5]
 
 output:
   root_dir: outputs/evaluation_results

@@ -29,7 +29,7 @@ NUM_CLASSES = len(CLASS_NAMES)
 COORD_DIM = 63
 VELOCITY_DIM = 63
 FEATURE_DIM = 2 + COORD_DIM + VELOCITY_DIM
-SCHEMA_VERSION = "gesture_sequence_v2"
+SCHEMA_VERSION = "gesture_sequence_v3"
 IGNORE_INDEX = -100
 SCORE_INDEX = 0
 VALID_MASK_INDEX = 1
@@ -86,6 +86,11 @@ class SequenceRecord:
     hand_side: str = "R"
     subject_id: str = ""
     session_id: str = ""
+    source: str = ""
+    gender: str = ""
+    field3: str = ""
+    scene: str = "unknown"
+    polarity: str = "unknown"
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -121,6 +126,11 @@ class SequenceRecord:
             "hand_side": np.asarray(self.hand_side),
             "subject_id": np.asarray(self.subject_id),
             "session_id": np.asarray(self.session_id),
+            "source": np.asarray(self.source),
+            "gender": np.asarray(self.gender),
+            "field3": np.asarray(self.field3),
+            "scene": np.asarray(self.scene),
+            "polarity": np.asarray(self.polarity),
             "schema_version": np.asarray(SCHEMA_VERSION),
             "feature_names": np.asarray(FEATURE_NAMES),
             "class_names": np.asarray(CLASS_NAMES),
@@ -169,6 +179,11 @@ def load_sequence(path: str | Path) -> SequenceRecord:
         hand_side=str(archive["hand_side"]) if "hand_side" in archive.files else "R",
         subject_id=str(archive["subject_id"]) if "subject_id" in archive.files else "",
         session_id=str(archive["session_id"]) if "session_id" in archive.files else "",
+        source=str(archive["source"]) if "source" in archive.files else "",
+        gender=str(archive["gender"]) if "gender" in archive.files else "",
+        field3=str(archive["field3"]) if "field3" in archive.files else "",
+        scene=str(archive["scene"]) if "scene" in archive.files else "unknown",
+        polarity=str(archive["polarity"]) if "polarity" in archive.files else "unknown",
         metadata=metadata,
     )
 
@@ -182,6 +197,11 @@ def sequence_summary(record: SequenceRecord) -> dict[str, Any]:
         "hand_side": record.hand_side,
         "subject_id": record.subject_id,
         "session_id": record.session_id,
+        "source": record.source,
+        "gender": record.gender,
+        "field3": record.field3,
+        "scene": record.scene,
+        "polarity": record.polarity,
         "has_labels": record.labels is not None,
         "valid_ratio": float(record.valid_mask.mean()) if record.num_frames else 0.0,
     }

@@ -1,0 +1,77 @@
+version: 1
+# Matching is exact after lower/strip/underscore-to-hyphen normalization.
+# Unknown compound names such as stand-alarm-strong remain unknown.
+exact:
+  sit: {polarity: positive, category: posture}
+  stand: {polarity: positive, category: posture}
+  walk: {polarity: positive, category: posture}
+  jog: {polarity: positive, category: posture}
+  lie-up: {polarity: positive, category: posture}
+  lie-right: {polarity: positive, category: posture}
+  lie-left: {polarity: positive, category: posture}
+  lie-down: {polarity: positive, category: posture}
+  elevator: {polarity: positive, category: posture}
+  elliptical: {polarity: positive, category: posture}
+  indoor-bike: {polarity: positive, category: posture}
+  treadmill: {polarity: positive, category: posture}
+  gesture-sit-naozhong: {polarity: positive, category: compound}
+  gesture-sit-laidian: {polarity: positive, category: compound}
+  gesture-stand-naozhong: {polarity: positive, category: compound}
+  gesture-stand-laidian: {polarity: positive, category: compound}
+  gesture-lie-laidian: {polarity: positive, category: compound}
+  gesture-lie-naozhong: {polarity: positive, category: compound}
+  gesture-walk-laidian: {polarity: positive, category: compound}
+  gesture-walk-naozhong: {polarity: positive, category: compound}
+  gesture-jog-laidian: {polarity: positive, category: compound}
+  gesture-jog-naozhong: {polarity: positive, category: compound}
+  gesture-treadmill-laidian: {polarity: positive, category: compound}
+  gesture-treadmill-naozhong: {polarity: positive, category: compound}
+  gesture-indoor-bike-laidian: {polarity: positive, category: compound}
+  gesture-indoor-bike-naozhong: {polarity: positive, category: compound}
+  gesture-elliptical-laidian: {polarity: positive, category: compound}
+  gesture-elliptical-naozhong: {polarity: positive, category: compound}
+
+  wrist: &confounder {polarity: negative, category: confounder, hard_negative: true}
+  lie-wrist: *confounder
+  sit-wrist: *confounder
+  pen: *confounder
+  cup: *confounder
+  twist: *confounder
+  type: *confounder
+  type-reinforce: *confounder
+  phone-type: *confounder
+  click-mouse: *confounder
+  brush-teeth: *confounder
+  dine: *confounder
+  phone: *confounder
+  surface: *confounder
+  index-surface: *confounder
+  wash: *confounder
+  still: *confounder
+  clap: *confounder
+  stroll: *confounder
+  work: *confounder
+  drive: *confounder
+  spread: *confounder
+  fluttering: *confounder
+  knock-watch: *confounder
+  touch-screen: *confounder
+  knock-arm: *confounder
+  press: *confounder
+  daily: *confounder
+  grasp: *confounder
+  wristband: *confounder
+  raise-wrist: *confounder
+  swing: *confounder
+
+  timer-strong: &vibration {polarity: negative, category: vibration, hard_negative: true}
+  timer-weak: *vibration
+  alarm-strong: *vibration
+  alarm-weak: *vibration
+  ring-strong: *vibration
+  ring-weak: *vibration
+
+  background-walk: &pure_background {polarity: negative, category: pure_background, hard_negative: true}
+  background-jog: *pure_background
+
+aliases: {}

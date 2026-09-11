@@ -1,0 +1,37 @@
+正向场景
+sit（坐）	gesture-sit-naozhong（手势坐闹钟振动强）
+stand（站）	gesture-sit-laidian（手势坐来电振动强）
+walk（步行）	gesture-stand-naozhong（手势站闹钟振动强）
+jog（慢跑）	gesture-stand-laidian（手势站来电振动强）
+lie-up（仰卧）	gesture-lie-laidian（手势X卧端平来电）
+lie-right（右侧卧）	gesture-lie-naozhong（手势X卧端平闹钟）
+lie-left（左侧卧）	gesture-walk-laidian（手势走路端平来电）
+lie-down（趴卧）	gesture-walk-naozhong（手势走路端平闹钟）
+elevator（电梯）	gesture-jog-laidian（手势跑端平来电）
+elliptical（椭圆机）	gesture-jog-naozhong（手势跑端平闹钟）
+indoor-bike（动感单车）	gesture-treadmill-laidian（手势跑步机端平来电）
+Treadmill（跑步机）	gesture-treadmill-naozhong（手势跑步机端平闹钟）
+gesture-indoor-bike-laidian（手势动感单车端平来电）	gesture-elliptical-laidian（手势椭圆机端平来电）
+gesture-indoor-bike-naozhong（手势动感单车端平闹钟）	gesture-elliptical-naozhong（手势椭圆机端平闹钟）
+
+
+
+负向场景	
+wrist（翻腕）	Work（办公）
+lie-wrist（躺着抬腕）	Drive（开车）
+sit-wrist（坐着抬腕）	Spread（五指张开）
+pen（按压笔帽）	Fluttering（五指乱动）
+cup（拿杯子）	Knock-watch（敲表）
+twist（拧瓶盖）	Touch-screen（敲屏幕）
+Type/type-reinforce（键盘打字）	Knock-arm（敲手）
+phone-type（手机打字）	Press（按桌子）
+click-mouse（点鼠标）	Daily（日常）
+brush-teeth（刷牙）	Timer-strong/timer-weak（定时器强/弱振动）
+Dine（拿筷子）	Alarm-strong/alarm-weak（闹钟强/弱振动）
+Phone（划手机）	Ring-strong/ring-weak（来电强/弱振动）
+Surface（敲桌子）	Grasp（握拳）
+Index-surface（食指敲桌子）	Twist（拧瓶盖）
+Wash（洗手）	Wristband（扯表带）
+Still（静止）	Raise-wrist（抬腕）
+Clap（鼓掌）	Swing（走路摆臂）
+Stroll（走路）	Background-walk/background-jog（走路/跑步背景数据）

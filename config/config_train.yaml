@@ -3,11 +3,13 @@ device: auto
 
 data:
   processed_dir: data/processed
-  manifest_path: data/processed/splits.json
+  manifest_path: data/manifests/all5.json
   mapping_path: data/mapping.txt
   window_size: 60
   stride: 12
   keep_background_prob: 0.0
+  hard_negative_ratio: 0.15
+  hard_negative_max_windows_per_video: 20
   dynamic_action_windows: true
   action_windows_per_segment: 3
   num_workers: 0

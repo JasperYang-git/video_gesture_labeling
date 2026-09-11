@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+from collections import Counter
 from pathlib import Path
 
 import torch
@@ -62,6 +63,10 @@ def main() -> None:
     for path in val_files:
         logger.info("Validation video: %s", path.name)
     log_class_distribution(logger, "Training frames", train_loader.dataset.frame_labels)
+    logger.info(
+        "Training window roles: %s",
+        dict(Counter(window.window_role for window in train_loader.dataset.windows)),
+    )
     log_class_distribution(
         logger,
         "Validation frames",

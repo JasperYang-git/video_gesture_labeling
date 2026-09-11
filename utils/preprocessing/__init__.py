@@ -17,6 +17,11 @@ from utils.preprocessing.pipeline import (
     process_raw_video,
     process_raw_videos,
 )
+from utils.preprocessing.inventory import InventoryEntry, scan_inventory
+from utils.preprocessing.tracks import TrackConfig, extract_inventory
+from utils.preprocessing.assemble import AssembleConfig, assemble_inventory
+from utils.preprocessing.audit import AuditConfig, audit_inventory
+from utils.preprocessing.manifest import ManifestConfig, build_experiment_manifest
 
 __all__ = [
     "AnnotationInterval",
@@ -32,4 +37,14 @@ __all__ = [
     "parse_nova_annotation",
     "process_raw_video",
     "process_raw_videos",
+    "InventoryEntry",
+    "scan_inventory",
+    "TrackConfig",
+    "extract_inventory",
+    "AssembleConfig",
+    "assemble_inventory",
+    "AuditConfig",
+    "audit_inventory",
+    "ManifestConfig",
+    "build_experiment_manifest",
 ]

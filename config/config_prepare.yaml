@@ -1,37 +1,69 @@
 seed: 42
 
+inventory:
+  raw_root: ~/video_dataset
+  sources: [data_lm, data_ln_once, data_ln_twice, data_sr, data_vj]
+  taxonomy_path: config/scene_taxonomy.yaml
+  output_jsonl: data/inventory/inventory.jsonl
+  output_csv: data/inventory/inventory.csv
+  summary_path: data/inventory/summary.json
+  include_unknown_for_extraction: false
+
+extract:
+  num_workers: 4
+  physical_hand: right
+  input_mirrored: false
+  allow_opposite_hand_fallback: false
+  handedness_threshold: 0.7
+  max_num_hands: 2
+  model_complexity: 1
+  cache_dir: data/cache/tracks
+  status_path: data/inventory/extract_status.jsonl
+  preview_dir: data/audit/right_hand_previews
+  preview_count: 6
+
+assemble:
+  output_dir: data/processed
+  target_fps: 15.0
+  one_euro_min_cutoff: 1.0
+  one_euro_beta: 0.007
+  one_euro_d_cutoff: 1.0
+  status_path: data/inventory/assemble_status.jsonl
+
+audit:
+  output_dir: data/audit
+  quality_threshold: 0.6
+  min_class_detection_threshold: 0.0
+  exclude_unknown_scenes: true
+
+manifest:
+  enabled_in_all: false
+  name: all5
+  output_dir: data/manifests
+  processed_dir: data/processed
+  audit_path: data/audit/quality_audit.csv
+  subject_splits_path: data/manifests/subject_splits.json
+  seed: 42
+  train_ratio: 0.7
+  validation_ratio: 0.15
+  test_ratio: 0.15
+  sources: []
+  train_sources: []
+  test_sources: []
+  scenes: []
+  polarities: [positive, negative]
+
+# Backward-compatible mock smoke path only.
 data:
-  raw_root: data/users/default
   processed_dir: data/processed
   manifest_path: data/processed/splits.json
-  mapping_path: data/mapping.txt
-  subject_mapping_path: data/subject_mapping.csv
-  missing_subject_report: data/processed/missing_subject_mapping.csv
   train_ratio: 0.7
   validation_ratio: 0.15
   test_ratio: 0.15
   overwrite: false
 
-split:
-  # Use "video" only when subject identities truly are unavailable and the
-  # resulting metrics are explicitly understood as video-level generalisation.
-  strategy: subject
-
-preprocessing:
-  # Start with 4 on the 72-core shared server. Increase to 7 after one
-  # successful real-data run while CPU and memory remain healthy.
-  num_workers: 4
-  target_fps: 15.0
-  hand_side: R
-  min_detection_confidence: 0.7
-  quality_threshold: 0.6
-  one_euro_min_cutoff: 1.0
-  one_euro_beta: 0.007
-  one_euro_d_cutoff: 1.0
-  cache_dir: data/cache
-
 mock:
-  enabled: true
+  enabled: false
   output_dir: data/processed
   videos_per_split:
     train: 8

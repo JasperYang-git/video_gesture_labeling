@@ -9,8 +9,8 @@ import numpy as np
 
 from utils.config import load_config
 from utils.logger import create_run_directory, setup_logger
-from utils.metrics import aggregate_metrics, evaluate_sequence
-from utils.schema import load_sequence
+from utils.metrics import aggregate_metrics, evaluate_sequence, labels_to_segments
+from utils.schema import BACKGROUND_ID, SequenceRecord, load_sequence
 from utils.split import load_manifest
 from utils.trainer import seed_everything
 
@@ -52,6 +52,67 @@ def load_prediction(predictions_dir: Path, video_id: str) -> np.ndarray:
     raise FileNotFoundError(f"No prediction.npy found for {video_id} under {predictions_dir}")
 
 
+def negative_video_metrics(
+    prediction: np.ndarray,
+    fps: float,
+) -> dict[str, float | int]:
+    action_segments = [
+        segment
+        for segment in labels_to_segments(prediction)
+        if segment.label != BACKGROUND_ID
+    ]
+    duration_minutes = len(prediction) / fps / 60.0 if fps > 0 else 0.0
+    return {
+        "false_positive_frame_rate": (
+            float(np.mean(prediction != BACKGROUND_ID)) if len(prediction) else 0.0
+        ),
+        "predicted_action_segments": len(action_segments),
+        "false_actions_per_minute": (
+            len(action_segments) / duration_minutes if duration_minutes > 0 else 0.0
+        ),
+    }
+
+
+def _metadata_group(record: SequenceRecord, key: str) -> str:
+    value = record.metadata.get(key, "unknown")
+    if isinstance(value, np.ndarray):
+        value = value.item() if value.shape == () else ",".join(map(str, value.tolist()))
+    text = str(value).strip()
+    return text or "unknown"
+
+
+def grouped_metrics(
+    per_video: list[dict[str, float | int | str]],
+) -> dict[str, dict[str, dict[str, float | int]]]:
+    grouped: dict[str, dict[str, dict[str, float | int]]] = {}
+    for field in ("source", "scene", "polarity"):
+        buckets: dict[str, list[dict[str, float | int | str]]] = {}
+        for metrics in per_video:
+            buckets.setdefault(str(metrics[field]), []).append(metrics)
+        grouped[field] = {}
+        for value, items in sorted(buckets.items()):
+            numeric_keys = sorted(
+                {
+                    key
+                    for item in items
+                    for key, metric in item.items()
+                    if isinstance(metric, (int, float)) and not isinstance(metric, bool)
+                }
+            )
+            summary: dict[str, float | int] = {"video_count": len(items)}
+            for key in numeric_keys:
+                values = [
+                    float(item[key])
+                    for item in items
+                    if isinstance(item.get(key), (int, float))
+                    and not isinstance(item.get(key), bool)
+                ]
+                if values:
+                    summary[key] = float(np.mean(values))
+            grouped[field][value] = summary
+    return grouped
+
+
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
@@ -84,6 +145,11 @@ def main() -> None:
             )
         metrics = evaluate_sequence(prediction, record.labels, iou_thresholds)
         metrics["video_id"] = record.video_id
+        metrics["source"] = _metadata_group(record, "source")
+        metrics["scene"] = _metadata_group(record, "scene")
+        metrics["polarity"] = _metadata_group(record, "polarity")
+        if str(metrics["polarity"]).lower() == "negative":
+            metrics.update(negative_video_metrics(prediction, record.fps))
         per_video.append(metrics)
         logger.info(
             "%s | acc=%.3f | edit=%.2f | %s",
@@ -97,11 +163,20 @@ def main() -> None:
         )
 
     numeric = [
-        {key: value for key, value in item.items() if key != "video_id"}
+        {
+            key: value
+            for key, value in item.items()
+            if key in {"frame_accuracy", "edit"}
+            or key.startswith("f1@")
+        }
         for item in per_video
     ]
     summary = aggregate_metrics(numeric)
-    payload = {"summary": summary, "per_video": per_video}
+    payload = {
+        "summary": summary,
+        "per_video": per_video,
+        "grouped": grouped_metrics(per_video),
+    }
     output_path = run_dir / "metrics.json"
     output_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     logger.info("Summary: %s", summary)

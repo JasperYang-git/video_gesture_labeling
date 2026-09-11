@@ -113,11 +113,20 @@ def generate_mock_sequence(
         hand_side="R",
         subject_id=subject_id,
         session_id=session_id,
+        source="mock",
+        gender="unknown",
+        field3="mock",
+        scene="mock-positive",
+        polarity="positive",
         metadata={
             "source": "mock",
+            "scene": "mock-positive",
+            "polarity": "positive",
+            "scene_category": "mock",
+            "hard_negative_eligible": False,
             "class_names": list(CLASS_NAMES),
-            "preprocess_fingerprint": "mock_v2_audit",
-            "preprocess_config_fingerprint": "mock_v2_audit",
+            "preprocess_fingerprint": "mock_v3",
+            "preprocess_config_fingerprint": "mock_v3",
             "quality_passed": True,
             "detection_rate": detection_rate,
             "per_class_detection_rate": per_class_detection_rate,
@@ -167,7 +176,7 @@ def generate_mock_dataset(
                 else:
                     if (
                         existing.metadata.get("preprocess_config_fingerprint")
-                        == "mock_v2_audit"
+                        == "mock_v3"
                     ):
                         split_files[split_name].append(output_path)
                         file_index += 1

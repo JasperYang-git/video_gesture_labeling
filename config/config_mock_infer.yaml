@@ -3,8 +3,7 @@ device: auto
 
 data:
   processed_dir: data/processed
-  manifest_path: data/manifests/all5.json
-  mapping_path: data/mapping.txt
+  manifest_path: data/processed/splits.json
   split: test
   input_paths: []
   window_size: 60
