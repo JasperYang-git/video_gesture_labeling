@@ -1,0 +1,43 @@
+seed: 42
+device: auto
+
+# Folder of recordings to annotate. Every directory holding an .mp4 becomes one
+# sample; directory names may follow the ID_Sex_Side_Scene convention but do not
+# have to, unparsed fields simply become "unknown".
+video_root: videos
+
+# Must match the training-time preprocessing, otherwise the checkpoint fingerprint
+# check in utils/inference.py rejects the sequences.
+extract:
+  num_workers: 4
+  physical_hand: right
+  input_mirrored: false
+  allow_opposite_hand_fallback: false
+  handedness_threshold: 0.7
+  max_num_hands: 2
+  model_complexity: 1
+  cache_dir: data/cache/tracks
+
+assemble:
+  # Deliberately not data/processed: unlabeled sequences must not be picked up by
+  # build_experiment_manifest and leak into the training corpus.
+  output_dir: data/processed_infer
+  target_fps: 15.0
+  one_euro_min_cutoff: 1.0
+  one_euro_beta: 0.007
+  one_euro_d_cutoff: 1.0
+
+inference:
+  model_path: outputs/best_model.pth
+  window_size: 60
+  stride: 12
+
+outputs:
+  write_annotation: true
+  write_timeline: true
+  write_srt: true
+  mux: false
+  # Never clobber a hand-made gestures.annotation~; predictions land next to it as
+  # gestures.pred.annotation~ unless this is turned on.
+  overwrite_annotation: false
+  root_dir: outputs/annotate_results

@@ -16,6 +16,9 @@ DEFAULT_TAXONOMY_PATH = Path(__file__).resolve().parents[2] / "config" / "scene_
 ANNOTATION_DIRECTORY_NAME = "NOVA project"
 ANNOTATION_FILE_NAME = "gestures.annotation~"
 ANNOTATION_RELATIVE_PATH = Path(ANNOTATION_DIRECTORY_NAME) / ANNOTATION_FILE_NAME
+# Written next to a machine-generated annotation so later runs can tell their own
+# output apart from a hand annotation instead of scoring predictions against them.
+PREDICTION_MARKER_NAME = ".gestures.predicted.json"
 DEFAULT_SCAN_WORKERS = 16
 
 _Item = TypeVar("_Item")
@@ -376,6 +379,90 @@ def scan_inventory(
                     error=";".join(errors) if errors else None,
                 )
             )
+    return entries
+
+
+PREDICTION_VIDEO_SUFFIX = "_pred.mp4"
+
+
+def _is_scannable_video(video: _VideoFile) -> bool:
+    """Skip our own muxed output so a second run does not annotate its own results."""
+    return not video.path.name.endswith(PREDICTION_VIDEO_SUFFIX)
+
+
+def scan_video_root(
+    video_root: str | Path,
+    source_name: str = "inference",
+    max_workers: int = DEFAULT_SCAN_WORKERS,
+) -> list[InventoryEntry]:
+    """Scan recordings for inference: one entry per .mp4, independent of naming.
+
+    Two layouts are supported side by side. A directory holding a single video is
+    treated as the sample folder itself, which is the training layout
+    (``<subject>_<gender>_<field3>_<scene>/clip.mp4`` next to ``NOVA project/``) and the
+    only case where directory-name metadata is parsed. Anything else, in particular a
+    flat dump of files such as ``DJI_20260613115350_LN043-bike1-5.mp4``, gets a sample
+    folder named after the video file, so outputs never collide and no naming
+    convention is assumed.
+
+    Unlike :func:`scan_inventory` this never marks an entry as ``error``: a missing
+    annotation is the normal case here. Existing annotations are still reported so
+    callers can show ground truth next to the prediction.
+    """
+    root = Path(video_root).expanduser()
+    if not root.is_dir():
+        raise FileNotFoundError(f"Video root is not a directory: {root}")
+
+    listings = _walk_source(root, max_workers)
+    videos_by_directory = {
+        directory: tuple(video for video in listing.videos if _is_scannable_video(video))
+        for directory, listing in listings.items()
+        if directory.name != ANNOTATION_DIRECTORY_NAME
+    }
+
+    sample_directories: list[tuple[Path, _VideoFile, bool]] = []
+    for directory, videos in videos_by_directory.items():
+        # A lone video inside a nested folder means that folder is the sample; the scan
+        # root itself never is, otherwise outputs would land next to every recording.
+        folder_is_sample = len(videos) == 1 and directory != root
+        for video in videos:
+            sample_dir = directory if folder_is_sample else directory / video.path.stem
+            sample_directories.append((sample_dir, video, folder_is_sample))
+    sample_directories.sort(key=lambda item: item[0].relative_to(root).as_posix())
+
+    annotations = _map_threaded(
+        _annotation_path, [item[0] for item in sample_directories], max_workers
+    )
+
+    entries: list[InventoryEntry] = []
+    for (sample_dir, video, folder_is_sample), annotation in zip(
+        sample_directories, annotations
+    ):
+        name_error: str | None = None
+        subject_id = gender = field3 = scene_raw = None
+        if folder_is_sample:
+            subject_id, gender, field3, scene_raw, name_error = _parse_directory_name(
+                sample_dir.name
+            )
+        entries.append(
+            InventoryEntry(
+                source=source_name,
+                video_id="__".join((source_name, *sample_dir.relative_to(root).parts)),
+                directory_path=str(sample_dir),
+                video_path=str(video.path),
+                annotation_path=str(annotation) if annotation else None,
+                subject_id=subject_id or "unknown",
+                gender=gender or "unknown",
+                field3=field3 or "unknown",
+                scene_raw=scene_raw or "unknown",
+                scene="unknown",
+                polarity="unknown",
+                status="ok",
+                video_size=video.size,
+                video_mtime_ns=video.mtime_ns,
+                error=name_error,
+            )
+        )
     return entries
 
 

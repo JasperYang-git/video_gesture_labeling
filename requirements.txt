@@ -3,3 +3,4 @@ PyYAML
 torch
 opencv-python
 mediapipe
+matplotlib

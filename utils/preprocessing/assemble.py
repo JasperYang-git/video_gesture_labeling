@@ -110,7 +110,8 @@ def assemble_entry(
             "error": str(track_path),
         }
     track = load_track(track_path)
-    annotation_sha = _annotation_sha256(entry.annotation_path)
+    annotation_path = getattr(entry, "annotation_path", None)
+    annotation_sha = _annotation_sha256(annotation_path) if annotation_path else ""
     combined_fingerprint = hashlib.sha256(
         (
             str(track["metadata"]["track_fingerprint"])
@@ -140,17 +141,19 @@ def assemble_entry(
             }
 
     source_fps = float(track["source_fps"])
-    intervals = parse_nova_annotation(entry.annotation_path)
-    source_labels = labels_from_intervals(
-        len(track["landmarks"]), source_fps, intervals
-    )
-    if entry.polarity == "negative" and np.any(source_labels != BACKGROUND_ID):
-        return {
-            "video_id": entry.video_id,
-            "source": entry.source,
-            "status": "annotation_conflict",
-            "error": "Negative scene contains non-background annotation labels",
-        }
+    source_labels: np.ndarray | None = None
+    if annotation_path:
+        intervals = parse_nova_annotation(annotation_path)
+        source_labels = labels_from_intervals(
+            len(track["landmarks"]), source_fps, intervals
+        )
+        if entry.polarity == "negative" and np.any(source_labels != BACKGROUND_ID):
+            return {
+                "video_id": entry.video_id,
+                "source": entry.source,
+                "status": "annotation_conflict",
+                "error": "Negative scene contains non-background annotation labels",
+            }
 
     coordinates, palms = _prepare_source_tracks(
         track["landmarks"],
@@ -166,11 +169,13 @@ def assemble_entry(
         source_fps,
         config.target_fps,
     )
-    labels = align_labels_to_target_fps(
-        source_labels, source_fps, config.target_fps
+    labels = (
+        None
+        if source_labels is None
+        else align_labels_to_target_fps(source_labels, source_fps, config.target_fps)
     )
     features = build_feature_matrix(normalized, quality, mask, config.target_fps)
-    if features.shape[1] != len(labels):
+    if labels is not None and features.shape[1] != len(labels):
         raise ValueError(
             f"{entry.video_id}: feature/label length mismatch "
             f"{features.shape[1]} != {len(labels)}"

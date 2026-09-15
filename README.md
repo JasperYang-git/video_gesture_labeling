@@ -19,6 +19,7 @@
 train_script.py
 infer_script.py
 evaluate_script.py
+annotate_videos.py
 prepare_data.py
 config/
 model/
@@ -108,6 +109,78 @@ inventory、extract、assemble、audit，但不会自动生成 manifest。
 视频不是镜像输入。根据 MediaPipe 的自拍镜像约定，物理右手对应输出标签 `Left`。
 程序只接受该候选，低置信度或只检测到物理左手时记录 `v_mask=0`，绝不回退到左手。
 
+## 给新视频打标注（annotate_videos.py）
+
+拿到一批新录的视频，想直接看模型预测什么、准不准，用这条链路。它从 mp4 一路跑到
+标注文件，不需要事先有标注，也不需要 manifest：
+
+```bash
+python annotate_videos.py --config config/config_annotate.yaml --video-root ~/new_videos
+
+# 先拿两条试跑，确认 MediaPipe 能抽到手
+python annotate_videos.py --video-root ~/new_videos --limit 2
+
+# 额外产出带软字幕的 mp4，播放时字幕与画面同步
+python annotate_videos.py --video-root ~/new_videos --mux
+```
+
+内部依次是 扫描 → MediaPipe 抽轨迹 → 装配 128 维特征 → 重叠窗口推理 → 写产物，
+复用 `prepare_data.py` 的同一套缓存，所以中断后重跑会跳过已完成的视频。
+`config/config_annotate.yaml` 里的 `extract` 和 `assemble` 两段必须与训练时一致，
+否则 checkpoint 的 fingerprint 校验会直接报错——这是有意的保护，不要绕过。
+
+### 目录布局与命名
+
+**与视频命名无关，一个 mp4 就是一个样本。** 两种布局可以混在同一个根目录下：
+
+```text
+new_videos/
+├── DJI_20260613115350_LN043-bike1-5.mp4     # 扁平：无标签测试数据
+├── VID_20260613_090940_LN044-stand4-5.mp4
+└── DG2026091502_F_R_walk/                   # 训练布局：文件夹内单个视频
+    ├── recording.mp4
+    └── NOVA project/gestures.annotation~
+```
+
+判定规则只有一条：**某个文件夹里只有一个视频时，该文件夹就是样本目录**（这是训练
+数据的布局，也只有这种情况才会按 `<subject>_<gender>_<field3>_<scene>` 解析目录名）；
+其余情况给每个视频建一个以文件名命名的子目录。所以上面的例子会产出：
+
+```text
+new_videos/
+├── DJI_20260613115350_LN043-bike1-5/
+│   ├── NOVA project/gestures.annotation~    # 预测标注
+│   ├── gestures_timeline.png                # 时间轴条带图
+│   ├── gestures.srt
+│   └── ..._pred.mp4                         # 仅 --mux
+└── DG2026091502_F_R_walk/
+    ├── NOVA project/gestures.annotation~    # 人工真值，不会被动
+    ├── NOVA project/gestures.pred.annotation~
+    └── gestures_timeline.png                # 预测 / 真值 / 错误 三行
+```
+
+### 怎么看结果
+
+先看 `gestures_timeline.png`：横轴是时间，颜色代表类别，配色在所有视频间固定，
+所以不同视频可以横着对比。有真值时会多出真值行和标红的错误行，标题里带 frame
+accuracy，一整段视频对错一眼扫完，不用播放。只有需要逐秒核对时才去看软字幕版
+mp4（`--mux`），或者用播放器手动挂载 `gestures.srt`。
+
+标注文件每行是 `起始秒;结束秒;类别id;置信度;`，与训练数据同格式，可以直接用 NOVA
+打开修正后当训练数据用。置信度是该片段内预测类别的 softmax 均值，按它排序能快速
+挑出最该人工复核的片段。
+
+### 两条安全机制
+
+- **不覆盖人工标注**：目标位置已有 `gestures.annotation~` 时，预测写到同目录的
+  `gestures.pred.annotation~` 并打 warning。确实想覆盖时传 `--overwrite-annotation`。
+- **不把自己的输出当成真值**：脚本写出的标注旁边会留一个 `.gestures.predicted.json`
+  标记。重跑时凭它识别出"这是上次预测的"，原地覆盖而不是堆一堆 `.pred.` 文件，也
+  不会拿上次的预测当真值去算准确率。`--mux` 产出的 `*_pred.mp4` 同样会被扫描跳过。
+
+无标签序列写到 `data/processed_infer/`，刻意与训练语料 `data/processed/` 分开，
+避免被 `prepare_data.py manifest` 扫进训练集。
+
 ## Manifest、Fingerprint 与用户划分
 
 - **Inventory**（`data/inventory/inventory.jsonl`）记录磁盘上发现的全部样本。
@@ -124,8 +197,15 @@ background，并作为受控 hard negative 采样，默认约占动作窗口数�
 ## 输出
 
 - 训练：`outputs/training_results/MMDD/MMDD_HHMMSS/`，最优权重另存为 `outputs/best_model.pth`
-- 推理：每个视频的 `frames.csv`、`prediction.npy`、`segments.json`
-- 评估：`outputs/evaluation_results/.../metrics.json`
+- 推理：每个视频的 `frames.csv`、`prediction.npy`、`segments.json`。序列自带标签时
+  `frames.csv` 会多出 `true_label` / `true_name` / `correct` 三列，筛 `correct=0`
+  就能直接定位错帧
+- 评估：`outputs/evaluation_results/.../metrics.json`，同目录还有
+  `per_class_metrics.csv`（每类的帧级与段级 P/R/F1、样本量、最常被错判成哪一类）和
+  `confusion_matrix.csv`。日志会按帧级 F1 从差到好打印类别表，并单独提示测试集中
+  完全缺失的类别
+- 标注：`outputs/annotate_results/.../annotations.json` 索引，以及每个视频的
+  `prediction.npy` / `logits.npy`，事后复查不用重跑
 
 Checkpoint 自带模型名、参数、类别映射、manifest hash、视频列表、整视频验证指标和
 预处理 schema/fingerprint。输入数据和训练配方不兼容时，推理会明确报错。
@@ -136,6 +216,11 @@ Checkpoint 自带模型名、参数、类别映射、manifest hash、视频列�
 python -m unittest discover -s tests -v
 ```
 
-单元测试覆盖标注解析、稳健聚合、缓存失效、用户级划分、动态窗口、窗口掩码、模型
-形状、损失、重叠拼接和指标。MediaPipe 检出质量与真实时间对齐只有在拿到可运行的
-加密数据后才能验证。
+单元测试覆盖标注解析与写回、稳健聚合、缓存失效、用户级划分、动态窗口、窗口掩码、
+模型形状、损失、重叠拼接、指标，以及标注链路的目录扫描（扁平与训练两种布局）和
+覆盖保护。MediaPipe 检出质量与真实时间对齐只有在拿到可运行的加密数据后才能验证。
+
+标注时间戳按 0.1ms 量化并向内收一格再写出。`labels_from_intervals` 对结束时间取
+`ceil`，边界值经浮点乘法会溢出到下一帧（`2.24 * 25` 在 IEEE 下是
+`56.00000000000001`），不收这一格的话每个预测片段都会被系统性地拉长一帧。
+`test_round_trip_survives_timestamp_rounding` 用 5 种帧率守住这个行为。
