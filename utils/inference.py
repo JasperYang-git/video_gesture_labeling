@@ -137,6 +137,11 @@ def write_prediction_outputs(
 ) -> dict[str, Path]:
     video_dir = Path(output_dir) / record.video_id
     video_dir.mkdir(parents=True, exist_ok=True)
+    targets = record.labels if record.labels is not None else None
+    if targets is not None and targets.shape != prediction.shape:
+        raise ValueError(
+            f"{record.video_id}: labels {targets.shape} != prediction {prediction.shape}"
+        )
     written: dict[str, Path] = {}
     if save_frame_npy:
         npy_path = video_dir / "prediction.npy"
@@ -148,21 +153,32 @@ def write_prediction_outputs(
         csv_path = video_dir / "frames.csv"
         with csv_path.open("w", encoding="utf-8", newline="") as stream:
             writer = csv.writer(stream)
-            writer.writerow(["frame", "time_sec", "label", "name"])
+            header = ["frame", "time_sec", "label", "name"]
+            if targets is not None:
+                header.extend(["true_label", "true_name", "correct"])
+            writer.writerow(header)
             for index, label in enumerate(prediction.tolist()):
-                writer.writerow(
-                    [
-                        index,
-                        f"{index / record.fps:.4f}",
-                        int(label),
-                        class_id_to_name(int(label)),
-                    ]
-                )
+                row = [
+                    index,
+                    f"{index / record.fps:.4f}",
+                    int(label),
+                    class_id_to_name(int(label)),
+                ]
+                if targets is not None:
+                    true_label = int(targets[index])
+                    row.extend(
+                        [
+                            true_label,
+                            class_id_to_name(true_label),
+                            int(true_label == int(label)),
+                        ]
+                    )
+                writer.writerow(row)
         written["frames_csv"] = csv_path
     if save_segments:
         segments = labels_to_segments(prediction)
         json_path = video_dir / "segments.json"
-        payload = {
+        payload: dict[str, Any] = {
             "video_id": record.video_id,
             "schema_version": SCHEMA_VERSION,
             "fps": record.fps,
@@ -170,6 +186,11 @@ def write_prediction_outputs(
             "feature_names": FEATURE_NAMES,
             "segments": [segment.to_dict(record.fps) for segment in segments],
         }
+        if targets is not None:
+            payload["frame_accuracy"] = float(np.mean(prediction == targets))
+            payload["ground_truth_segments"] = [
+                segment.to_dict(record.fps) for segment in labels_to_segments(targets)
+            ]
         json_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         written["segments_json"] = json_path
     return written
