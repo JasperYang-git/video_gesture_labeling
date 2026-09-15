@@ -1,18 +1,25 @@
 from __future__ import annotations
 
 import csv
-import hashlib
 import json
+import os
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence, TypeVar
 
 import yaml
 
 
 DEFAULT_TAXONOMY_PATH = Path(__file__).resolve().parents[2] / "config" / "scene_taxonomy.yaml"
-ANNOTATION_RELATIVE_PATH = Path("NOVA project") / "gestures.annotation~"
+ANNOTATION_DIRECTORY_NAME = "NOVA project"
+ANNOTATION_FILE_NAME = "gestures.annotation~"
+ANNOTATION_RELATIVE_PATH = Path(ANNOTATION_DIRECTORY_NAME) / ANNOTATION_FILE_NAME
+DEFAULT_SCAN_WORKERS = 16
+
+_Item = TypeVar("_Item")
+_Result = TypeVar("_Result")
 
 
 @dataclass(frozen=True)
@@ -34,6 +41,8 @@ class InventoryEntry:
     taxonomy_version: int = 1
     video_size: int | None = None
     video_mtime_ns: int | None = None
+    # Only read back from inventories written before hashing moved into
+    # assemble, which computes it itself; scanning never populates it.
     annotation_sha256: str | None = None
     error: str | None = None
 
@@ -117,36 +126,157 @@ def _parse_directory_name(
     return parts[0], parts[1], parts[2], parts[3], None
 
 
-def _candidate_directories(source_root: Path) -> list[Path]:
-    candidates: set[Path] = set()
-    for directory in (source_root, *source_root.rglob("*")):
-        if not directory.is_dir() or directory.name == "NOVA project":
-            continue
-        has_video = any(
-            child.is_file() and child.suffix.lower() == ".mp4"
-            for child in directory.iterdir()
+def _map_threaded(
+    function: Callable[[_Item], _Result],
+    items: Iterable[_Item],
+    max_workers: int,
+) -> list[_Result]:
+    """Fan out latency-bound filesystem probes while preserving input order."""
+    item_list = list(items)
+    if max_workers <= 1 or len(item_list) <= 1:
+        return [function(item) for item in item_list]
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(item_list))) as executor:
+        return list(executor.map(function, item_list))
+
+
+def _io_error_text(exc: OSError) -> str:
+    reason = exc.strerror or type(exc).__name__
+    return f"io_error:{reason.replace(';', ',')}"
+
+
+@dataclass(frozen=True)
+class _VideoFile:
+    path: Path
+    size: int | None
+    mtime_ns: int | None
+
+
+@dataclass(frozen=True)
+class _DirectoryListing:
+    subdirectories: tuple[Path, ...] = ()
+    linked_subdirectories: tuple[Path, ...] = ()
+    videos: tuple[_VideoFile, ...] = ()
+    error: str | None = None
+
+
+def _video_file(child: os.DirEntry) -> _VideoFile:
+    try:
+        stat_result = child.stat()
+    except OSError:
+        return _VideoFile(Path(child.path), None, None)
+    return _VideoFile(
+        Path(child.path),
+        int(stat_result.st_size),
+        int(stat_result.st_mtime_ns),
+    )
+
+
+def _list_directory(directory: Path) -> _DirectoryListing:
+    """Read one directory once, keeping everything later decisions need."""
+    subdirectories: list[Path] = []
+    linked_subdirectories: list[Path] = []
+    videos: list[_VideoFile] = []
+    try:
+        with os.scandir(directory) as scan:
+            for child in scan:
+                try:
+                    if child.is_dir():
+                        target = (
+                            linked_subdirectories
+                            if child.is_symlink()
+                            else subdirectories
+                        )
+                        target.append(Path(child.path))
+                    elif child.is_file() and child.name.lower().endswith(".mp4"):
+                        videos.append(_video_file(child))
+                except OSError:
+                    continue
+    except OSError as exc:
+        return _DirectoryListing(error=_io_error_text(exc))
+    return _DirectoryListing(
+        subdirectories=tuple(subdirectories),
+        linked_subdirectories=tuple(linked_subdirectories),
+        videos=tuple(sorted(videos, key=lambda video: video.path.name)),
+    )
+
+
+def _walk_source(
+    source_root: Path,
+    max_workers: int,
+) -> dict[Path, _DirectoryListing]:
+    """List every directory below source_root exactly once, level by level.
+
+    Symlinked directories are listed but not descended into, so a link cycle
+    cannot make the scan run forever.
+    """
+    listings: dict[Path, _DirectoryListing] = {}
+    pending: list[tuple[Path, bool]] = [(source_root, True)]
+    while pending:
+        results = _map_threaded(
+            _list_directory,
+            [directory for directory, _ in pending],
+            max_workers,
         )
-        has_annotation = (directory / ANNOTATION_RELATIVE_PATH).is_file()
-        looks_named = len(directory.name.split("_")) >= 4
-        if has_video or has_annotation or looks_named:
-            candidates.add(directory)
-    return sorted(candidates, key=lambda item: item.relative_to(source_root).as_posix())
+        children: list[tuple[Path, bool]] = []
+        for (directory, descend), listing in zip(pending, results):
+            listings[directory] = listing
+            if not descend:
+                continue
+            children.extend((child, True) for child in listing.subdirectories)
+            children.extend(
+                (child, False) for child in listing.linked_subdirectories
+            )
+        pending = []
+        queued: set[Path] = set()
+        for child, descend in children:
+            if child in listings or child in queued:
+                continue
+            queued.add(child)
+            pending.append((child, descend))
+    return listings
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def _annotation_path(directory: Path) -> Path | None:
+    candidate = directory / ANNOTATION_RELATIVE_PATH
+    try:
+        return candidate if candidate.is_file() else None
+    except OSError:
+        return None
+
+
+def _source_level_entry(
+    source_name: str,
+    source_root: Path,
+    error: str,
+) -> InventoryEntry:
+    return InventoryEntry(
+        source=source_name,
+        video_id=source_name,
+        directory_path=str(source_root),
+        video_path=None,
+        annotation_path=None,
+        subject_id=None,
+        gender=None,
+        field3=None,
+        scene_raw=None,
+        scene=None,
+        polarity=None,
+        status="error",
+        error=error,
+    )
 
 
 def scan_inventory(
     raw_root: str | Path,
     sources: Iterable[str],
     taxonomy_path: str | Path = DEFAULT_TAXONOMY_PATH,
+    max_workers: int = DEFAULT_SCAN_WORKERS,
 ) -> list[InventoryEntry]:
-    """Scan named source directories and return deterministic inventory entries."""
+    """Scan named source directories and return deterministic inventory entries.
+
+    Unreadable inodes become ``io_error`` records instead of aborting the scan,
+    so one bad file on a flaky mount cannot discard hours of work.
+    """
     root = Path(raw_root).expanduser()
     taxonomy = load_taxonomy(taxonomy_path)
     entries: list[InventoryEntry] = []
@@ -154,47 +284,62 @@ def scan_inventory(
     for source in sources:
         source_name = str(source)
         source_root = root / source_name
-        if not source_root.is_dir():
+        try:
+            source_exists = source_root.is_dir()
+        except OSError as exc:
             entries.append(
-                InventoryEntry(
-                    source=source_name,
-                    video_id=source_name,
-                    directory_path=str(source_root),
-                    video_path=None,
-                    annotation_path=None,
-                    subject_id=None,
-                    gender=None,
-                    field3=None,
-                    scene_raw=None,
-                    scene=None,
-                    polarity=None,
-                    status="error",
-                    error="missing_source",
-                )
+                _source_level_entry(source_name, source_root, _io_error_text(exc))
+            )
+            continue
+        if not source_exists:
+            entries.append(
+                _source_level_entry(source_name, source_root, "missing_source")
             )
             continue
 
-        for directory in _candidate_directories(source_root):
+        listings = _walk_source(source_root, max_workers)
+        root_error = listings[source_root].error
+        if root_error:
+            entries.append(
+                _source_level_entry(source_name, source_root, root_error)
+            )
+            continue
+
+        considered = sorted(
+            (
+                directory
+                for directory in listings
+                if directory.name != ANNOTATION_DIRECTORY_NAME
+            ),
+            key=lambda item: item.relative_to(source_root).as_posix(),
+        )
+        annotations = _map_threaded(_annotation_path, considered, max_workers)
+        for directory, annotation in zip(considered, annotations):
+            listing = listings[directory]
+            looks_named = len(directory.name.split("_")) >= 4
+            # A directory that could not be listed is always reported: its
+            # contents are unknown, so it may have hidden whole samples.
+            if not (
+                listing.videos
+                or annotation is not None
+                or looks_named
+                or listing.error
+            ):
+                continue
+
             relative = directory.relative_to(source_root)
             video_id = "__".join((source_name, *relative.parts))
             subject_id, gender, field3, scene_raw, name_error = _parse_directory_name(
                 directory.name
             )
-            videos = sorted(
-                (
-                    child
-                    for child in directory.iterdir()
-                    if child.is_file() and child.suffix.lower() == ".mp4"
-                ),
-                key=lambda child: child.name,
-            )
-            annotation = directory / ANNOTATION_RELATIVE_PATH
             errors = []
+            if listing.error:
+                errors.append(listing.error)
             if name_error:
                 errors.append(name_error)
-            if not videos:
+            if not listing.videos:
                 errors.append("missing_mp4")
-            if not annotation.is_file():
+            if annotation is None:
                 errors.append("missing_nova_annotation")
 
             scene = polarity = None
@@ -208,13 +353,14 @@ def scan_inventory(
                     hard_negative_eligible,
                 ) = resolve_scene_details(scene_raw, taxonomy)
 
+            video = listing.videos[0] if listing.videos else None
             entries.append(
                 InventoryEntry(
                     source=source_name,
                     video_id=video_id,
                     directory_path=str(directory),
-                    video_path=str(videos[0]) if videos else None,
-                    annotation_path=str(annotation) if annotation.is_file() else None,
+                    video_path=str(video.path) if video else None,
+                    annotation_path=str(annotation) if annotation else None,
                     subject_id=subject_id,
                     gender=gender,
                     field3=field3,
@@ -225,32 +371,38 @@ def scan_inventory(
                     scene_category=scene_category,
                     hard_negative_eligible=hard_negative_eligible,
                     taxonomy_version=int(taxonomy.get("version", 1)),
-                    video_size=videos[0].stat().st_size if videos else None,
-                    video_mtime_ns=videos[0].stat().st_mtime_ns if videos else None,
-                    annotation_sha256=_sha256(annotation)
-                    if annotation.is_file()
-                    else None,
+                    video_size=video.size if video else None,
+                    video_mtime_ns=video.mtime_ns if video else None,
                     error=";".join(errors) if errors else None,
                 )
             )
     return entries
 
 
-def summarize_inventory(entries: Iterable[InventoryEntry]) -> dict[str, Any]:
+def _annotation_labels(path: str) -> list[str] | None:
+    from utils.preprocessing.annotations import parse_nova_annotation
+
+    try:
+        return [str(interval.label) for interval in parse_nova_annotation(path)]
+    except (OSError, ValueError):
+        return None
+
+
+def summarize_inventory(
+    entries: Iterable[InventoryEntry],
+    max_workers: int = DEFAULT_SCAN_WORKERS,
+) -> dict[str, Any]:
     entries_list = list(entries)
     label_intervals: Counter[str] = Counter()
     annotation_parse_errors = 0
-    from utils.preprocessing.annotations import parse_nova_annotation
-
-    for entry in entries_list:
-        if not entry.annotation_path:
-            continue
-        try:
-            intervals = parse_nova_annotation(entry.annotation_path)
-        except (OSError, ValueError):
+    annotation_paths = [
+        entry.annotation_path for entry in entries_list if entry.annotation_path
+    ]
+    for labels in _map_threaded(_annotation_labels, annotation_paths, max_workers):
+        if labels is None:
             annotation_parse_errors += 1
             continue
-        label_intervals.update(str(interval.label) for interval in intervals)
+        label_intervals.update(labels)
     return {
         "total": len(entries_list),
         "by_status": dict(sorted(Counter(entry.status for entry in entries_list).items())),
@@ -349,11 +501,20 @@ def read_inventory_csv(path: str | Path) -> list[InventoryEntry]:
         ]
 
 
-def write_summary_json(path: str | Path, entries: Iterable[InventoryEntry]) -> None:
+def write_summary_json(
+    path: str | Path,
+    entries: Iterable[InventoryEntry],
+    max_workers: int = DEFAULT_SCAN_WORKERS,
+) -> None:
     output = Path(path).expanduser()
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(
-        json.dumps(summarize_inventory(entries), ensure_ascii=False, indent=2, sort_keys=True)
+        json.dumps(
+            summarize_inventory(entries, max_workers),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
         + "\n",
         encoding="utf-8",
     )

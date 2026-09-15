@@ -17,6 +17,7 @@ from utils.preprocessing.assemble import (
 )
 from utils.preprocessing.audit import AuditConfig, audit_inventory
 from utils.preprocessing.inventory import (
+    DEFAULT_SCAN_WORKERS,
     InventoryEntry,
     read_inventory_jsonl,
     scan_inventory,
@@ -59,7 +60,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Pilot limit per source, applied after deterministic sorting",
     )
-    parser.add_argument("--workers", type=int, help="Override extract.num_workers")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        help="Override extract.num_workers and inventory.scan_workers",
+    )
     parser.add_argument(
         "--no-resume",
         action="store_true",
@@ -90,14 +95,21 @@ def _run_inventory(
     args: argparse.Namespace,
 ) -> list[InventoryEntry]:
     section, raw_root, sources = _inventory_settings(config, args)
-    entries = scan_inventory(raw_root, sources, section["taxonomy_path"])
+    workers = (
+        args.workers
+        if args.workers is not None
+        else int(section.get("scan_workers", DEFAULT_SCAN_WORKERS))
+    )
+    entries = scan_inventory(raw_root, sources, section["taxonomy_path"], workers)
     write_inventory_jsonl(section["output_jsonl"], entries)
     write_inventory_csv(section["output_csv"], entries)
-    write_summary_json(section["summary_path"], entries)
+    write_summary_json(section["summary_path"], entries, workers)
+    io_errors = sum(1 for item in entries if "io_error" in (item.error or ""))
     print(
         f"Inventory: {len(entries)} records; "
         f"status={dict(Counter(item.status for item in entries))}; "
-        f"polarity={dict(Counter(item.polarity or 'unknown' for item in entries))}"
+        f"polarity={dict(Counter(item.polarity or 'unknown' for item in entries))}; "
+        f"io_errors={io_errors}"
     )
     return entries
 

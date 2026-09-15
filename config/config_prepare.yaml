@@ -8,6 +8,7 @@ inventory:
   output_csv: data/inventory/inventory.csv
   summary_path: data/inventory/summary.json
   include_unknown_for_extraction: false
+  scan_workers: 16
 
 extract:
   num_workers: 4

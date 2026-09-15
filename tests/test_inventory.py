@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import errno
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from utils.preprocessing.inventory import (
     load_taxonomy,
@@ -114,6 +117,61 @@ class InventoryTests(unittest.TestCase):
             )
             self.assertIn("invalid_name", by_name["bad-name"].error or "")
             self.assertTrue(all(entry.status == "error" for entry in entries))
+
+    def test_unreadable_directories_are_recorded_without_aborting(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            _make_recording(root, "source", "S1_F_meta_sit")
+            _make_recording(root, "source", "batch/S2_M_meta_walk")
+            broken_sample = root / "source" / "S3_F_meta_lie-up"
+            (broken_sample / "NOVA project").mkdir(parents=True)
+            (broken_sample / "NOVA project" / "gestures.annotation~").touch()
+            broken_subtree = root / "source" / "batch"
+            real_scandir = os.scandir
+
+            def flaky_scandir(path=".", *args, **kwargs):
+                if Path(path) in {broken_sample, broken_subtree}:
+                    raise OSError(errno.EIO, "Input/output error", str(path))
+                return real_scandir(path, *args, **kwargs)
+
+            with mock.patch.object(os, "scandir", flaky_scandir):
+                entries = scan_inventory(root, ["source"], TAXONOMY_PATH)
+
+            by_id = {entry.video_id: entry for entry in entries}
+            self.assertEqual(by_id["source__S1_F_meta_sit"].status, "ok")
+
+            sample = by_id["source__S3_F_meta_lie-up"]
+            self.assertEqual(sample.status, "error")
+            self.assertIn("io_error", sample.error or "")
+            self.assertIn("missing_mp4", sample.error or "")
+
+            # The lost subtree must stay visible instead of vanishing silently.
+            subtree = by_id["source__batch"]
+            self.assertEqual(subtree.status, "error")
+            self.assertIn("io_error", subtree.error or "")
+            self.assertNotIn("source__batch__S2_M_meta_walk", by_id)
+
+    def test_scan_is_order_stable_across_worker_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for index in range(6):
+                _make_recording(root, "source", f"batch/S{index}_F_meta_sit")
+
+            sequential = scan_inventory(root, ["source"], TAXONOMY_PATH, 1)
+            threaded = scan_inventory(root, ["source"], TAXONOMY_PATH, 8)
+
+            self.assertEqual(sequential, threaded)
+            self.assertEqual(len(sequential), 6)
+
+    def test_scan_does_not_hash_annotations(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            _make_recording(root, "source", "S1_F_meta_sit")
+
+            entry = scan_inventory(root, ["source"], TAXONOMY_PATH)[0]
+
+            self.assertIsNone(entry.annotation_sha256)
+            self.assertIsNotNone(entry.annotation_path)
 
     def test_jsonl_csv_and_summary_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
