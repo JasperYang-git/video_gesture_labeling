@@ -87,6 +87,9 @@ def overlap_window_starts(num_frames: int, window_size: int, stride: int) -> lis
     return starts
 
 
+DEFAULT_PREDICT_BATCH_SIZE = 256
+
+
 def hamming_weights(length: int) -> np.ndarray:
     if length <= 1:
         return np.ones(length, dtype=np.float32)
@@ -101,24 +104,38 @@ def predict_sequence(
     device: torch.device,
     window_size: int,
     stride: int,
+    batch_size: int = DEFAULT_PREDICT_BATCH_SIZE,
 ) -> tuple[np.ndarray, np.ndarray]:
+    """Fuse overlapping window logits into one full-video prediction.
+
+    Windows are forwarded in batches purely for speed; they are accumulated in
+    ascending start order, so the fused result matches a window-at-a-time pass.
+    """
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
     frames = record.num_frames
     num_classes = int(getattr(model, "num_classes", model.PG.conv_out.out_channels))
     accum = np.zeros((num_classes, frames), dtype=np.float64)
     weights = np.zeros(frames, dtype=np.float64)
     window_weights = hamming_weights(window_size)
+    starts = overlap_window_starts(frames, window_size, stride)
 
-    for start in overlap_window_starts(frames, window_size, stride):
-        end = min(start + window_size, frames)
-        actual = end - start
-        window = np.zeros((FEATURE_DIM, window_size), dtype=np.float32)
-        window[:, :actual] = record.features[:, start:end]
-        if actual < window_size:
-            window[:, actual:] = window[:, actual - 1 : actual]
-        inputs = torch.from_numpy(window).unsqueeze(0).to(device)
-        logits = model(inputs)[-1][0, :, :actual].detach().cpu().numpy()
-        accum[:, start:end] += logits * window_weights[:actual]
-        weights[start:end] += window_weights[:actual]
+    for offset in range(0, len(starts), batch_size):
+        chunk = starts[offset : offset + batch_size]
+        batch = np.zeros((len(chunk), FEATURE_DIM, window_size), dtype=np.float32)
+        spans: list[tuple[int, int, int]] = []
+        for index, start in enumerate(chunk):
+            end = min(start + window_size, frames)
+            actual = end - start
+            batch[index, :, :actual] = record.features[:, start:end]
+            if actual < window_size:
+                batch[index, :, actual:] = batch[index, :, actual - 1 : actual]
+            spans.append((start, end, actual))
+        inputs = torch.from_numpy(batch).to(device)
+        logits = model(inputs)[-1].detach().cpu().numpy()
+        for index, (start, end, actual) in enumerate(spans):
+            accum[:, start:end] += logits[index, :, :actual] * window_weights[:actual]
+            weights[start:end] += window_weights[:actual]
 
     weights = np.maximum(weights, 1e-8)
     fused = (accum / weights).astype(np.float32)

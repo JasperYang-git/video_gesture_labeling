@@ -31,12 +31,14 @@ training:
   num_epochs: 8
   gradient_clip_norm: 5.0
   class_weighted_loss: true
+  class_weight_max_ratio: 50.0
   tmse_weight: 0.1
   tmse_clamp: 16.0
 
 validation:
   checkpoint_metric: f1@0.5
   stride: 12
+  batch_size: 256
   iou_thresholds: [0.1, 0.25, 0.5]
 
 output:

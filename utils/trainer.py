@@ -11,9 +11,12 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from utils.schema import IGNORE_INDEX, NUM_CLASSES
-from utils.inference import predict_sequence
+from utils.inference import DEFAULT_PREDICT_BATCH_SIZE, predict_sequence
 from utils.metrics import aggregate_metrics, evaluate_sequence
 from utils.schema import SequenceRecord
+
+
+DEFAULT_CLASS_WEIGHT_MAX_RATIO = 50.0
 
 
 def seed_everything(seed: int) -> None:
@@ -36,10 +39,30 @@ def make_class_weights(
     labels: list[int],
     device: torch.device,
     num_classes: int = NUM_CLASSES,
+    max_ratio: float = DEFAULT_CLASS_WEIGHT_MAX_RATIO,
 ) -> torch.Tensor:
-    counts = np.bincount(labels, minlength=num_classes).astype(np.float32)
-    counts = np.maximum(counts, 1.0)
-    weights = counts.sum() / (len(counts) * counts)
+    """Inverse-frequency weights whose largest/smallest ratio is bounded.
+
+    Plain inverse frequency is unusable while the taxonomy is only partially
+    collected: a class holding a thousand of twenty million frames would
+    outweigh the common ones by four orders of magnitude and its handful of
+    samples would dominate every gradient. Classes missing from ``labels`` are
+    pinned to the same ceiling rather than the 1/0 blow-up that clamping their
+    count to one used to produce.
+    """
+    if max_ratio < 1.0:
+        raise ValueError("max_ratio must be at least 1")
+    counts = np.bincount(labels, minlength=num_classes).astype(np.float64)
+    present = counts > 0
+    if not present.any():
+        return torch.ones(len(counts), dtype=torch.float32, device=device)
+    weights = np.empty_like(counts)
+    weights[present] = counts[present].sum() / (
+        int(present.sum()) * counts[present]
+    )
+    ceiling = float(weights[present].min()) * max_ratio
+    weights[present] = np.minimum(weights[present], ceiling)
+    weights[~present] = ceiling
     return torch.tensor(weights, dtype=torch.float32, device=device)
 
 
@@ -186,6 +209,7 @@ def evaluate_full_videos(
     window_size: int,
     stride: int,
     iou_thresholds: tuple[float, ...] = (0.1, 0.25, 0.5),
+    batch_size: int = DEFAULT_PREDICT_BATCH_SIZE,
 ) -> tuple[dict[str, float], list[dict[str, float | str]]]:
     model.eval()
     per_video: list[dict[str, float | str]] = []
@@ -194,7 +218,12 @@ def evaluate_full_videos(
         if record.labels is None:
             raise ValueError(f"{record.video_id}: labels are required for validation")
         prediction, _ = predict_sequence(
-            model, record, device, window_size=window_size, stride=stride
+            model,
+            record,
+            device,
+            window_size=window_size,
+            stride=stride,
+            batch_size=batch_size,
         )
         metrics = evaluate_sequence(prediction, record.labels, iou_thresholds)
         numeric.append(metrics)

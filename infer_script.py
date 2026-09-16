@@ -7,6 +7,7 @@ from pathlib import Path
 
 from utils.config import load_config
 from utils.inference import (
+    DEFAULT_PREDICT_BATCH_SIZE,
     load_checkpoint_model,
     predict_sequence,
     validate_record_compatibility,
@@ -66,6 +67,9 @@ def main() -> None:
     data_config = config["data"]
     window_size = int(data_config.get("window_size", checkpoint.get("window_size", 60)))
     stride = int(data_config.get("stride", checkpoint.get("stride", 12)))
+    batch_size = int(
+        config["inference"].get("batch_size", DEFAULT_PREDICT_BATCH_SIZE)
+    )
     files = resolve_input_files(data_config)
     logger.info("Run directory: %s", run_dir)
     logger.info("Device: %s; model: %s", device, model_path)
@@ -81,6 +85,7 @@ def main() -> None:
             device,
             window_size,
             stride,
+            batch_size,
         )
         written = write_prediction_outputs(
             run_dir,

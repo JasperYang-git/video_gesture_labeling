@@ -13,16 +13,17 @@ from model import build_model
 from utils.config import load_config
 from utils.data_loader import build_train_loaders
 from utils.logger import create_run_directory, log_class_distribution, setup_logger
+from utils.inference import DEFAULT_PREDICT_BATCH_SIZE
 from utils.schema import (
     CLASS_NAMES,
     FEATURE_DIM,
     FEATURE_NAMES,
     NUM_CLASSES,
     SCHEMA_VERSION,
-    load_sequence,
 )
 from utils.split import manifest_sha256
 from utils.trainer import (
+    DEFAULT_CLASS_WEIGHT_MAX_RATIO,
     evaluate,
     evaluate_full_videos,
     make_class_weights,
@@ -90,7 +91,15 @@ def main() -> None:
 
     training_config = config["training"]
     class_weights = (
-        make_class_weights(train_loader.dataset.frame_labels, device)
+        make_class_weights(
+            train_loader.dataset.frame_labels,
+            device,
+            max_ratio=float(
+                training_config.get(
+                    "class_weight_max_ratio", DEFAULT_CLASS_WEIGHT_MAX_RATIO
+                )
+            ),
+        )
         if training_config.get("class_weighted_loss", False)
         else None
     )
@@ -117,8 +126,13 @@ def main() -> None:
         for item in validation_config.get("iou_thresholds", [0.1, 0.25, 0.5])
     )
     checkpoint_metric = str(validation_config.get("checkpoint_metric", "f1@0.5"))
-    validation_records = [load_sequence(path) for path in val_files]
-    all_records = [load_sequence(path) for path in train_files + val_files]
+    validation_batch_size = int(
+        validation_config.get("batch_size", DEFAULT_PREDICT_BATCH_SIZE)
+    )
+    # The loaders already hold these records; re-reading them would double
+    # peak memory for no gain.
+    validation_records = list(validation_loader.dataset.records)
+    all_records = list(train_loader.dataset.records) + validation_records
     fingerprints = sorted(
         {
             str(
@@ -160,6 +174,7 @@ def main() -> None:
             int(config["data"]["window_size"]),
             validation_stride,
             iou_thresholds,
+            validation_batch_size,
         )
         if checkpoint_metric not in full_metrics:
             raise ValueError(

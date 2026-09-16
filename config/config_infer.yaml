@@ -12,6 +12,7 @@ data:
 
 inference:
   model_path: outputs/best_model.pth
+  batch_size: 256
   log_every_video: true
   save_frame_csv: true
   save_frame_npy: true
