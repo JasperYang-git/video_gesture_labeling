@@ -95,12 +95,23 @@ python prepare_data.py extract --workers 7
 python prepare_data.py assemble
 python prepare_data.py audit
 
-# 5. 划分方案确定后才生成实验 manifest
+# 5. 按 source 核对类别构成与场景覆盖
+python prepare_data.py stats
+
+# 6. 划分方案确定后才生成实验 manifest
 python prepare_data.py manifest
 ```
 
 可以用 `--sources data_lm data_sr data_vj` 只处理部分 source。`all` 默认运行
-inventory、extract、assemble、audit，但不会自动生成 manifest。
+inventory、extract、assemble、audit，但不会自动生成 stats 和 manifest。
+
+`stats` 只读 `data/processed` 下已装配的序列，所以统计的是 15 FPS 时间轴上、过完
+质量流程之后的构成，与 `data/inventory/summary.json`（原始标注、源 FPS、含下游会
+丢弃的样本）刻意区分。不带 `--sources` 时每个 source 一份报告；带 `--sources` 时
+把列出的 source **合并**成一份，例如 `--sources data_lm data_sr` 给出这两个文件夹
+合起来的构成。每份报告列出按类的动作段数与占比、缺失的类别、以及覆盖的场景——场景
+按 `jog (positive)` 的形式标注极性并按极性分组，便于核对负向场景的覆盖。结果同时
+落到 `data/stats/dataset_stats.json` 和 `data/stats/class_stats.csv`。
 
 真实路径依赖 `opencv-python` 和 `mediapipe`。昂贵的 MediaPipe 原始轨迹保存在
 `data/cache/tracks/`；平滑、目标 FPS、palm 归一化、标签对齐和质量阈值在后续阶段，

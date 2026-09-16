@@ -12,3 +12,4 @@ data/users/
 *.onnx
 .DS_Store
 env/
+data/

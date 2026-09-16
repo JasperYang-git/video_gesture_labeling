@@ -188,6 +188,64 @@ def load_sequence(path: str | Path) -> SequenceRecord:
     )
 
 
+@dataclass(frozen=True)
+class SequenceHeader:
+    """A sequence without its feature matrix.
+
+    ``features`` is the bulk of an archive, so scans that only need labels and
+    metadata read an order of magnitude less by never touching that member.
+    """
+
+    video_id: str
+    fps: float
+    num_frames: int
+    labels: np.ndarray | None
+    subject_id: str
+    source: str
+    scene: str
+    polarity: str
+    metadata: dict[str, Any]
+
+
+def load_sequence_header(path: str | Path) -> SequenceHeader:
+    with np.load(path, allow_pickle=True) as archive:
+        schema_version = str(archive["schema_version"])
+        if schema_version != SCHEMA_VERSION:
+            raise ValueError(
+                f"{path}: unsupported schema_version '{schema_version}', "
+                f"expected {SCHEMA_VERSION}"
+            )
+        stored_names = [str(name) for name in archive["feature_names"].tolist()]
+        if stored_names != FEATURE_NAMES:
+            raise ValueError(f"{path}: feature schema mismatch")
+        labels = (
+            np.asarray(archive["labels"], dtype=np.int64)
+            if "labels" in archive.files
+            else None
+        )
+        return SequenceHeader(
+            video_id=str(archive["video_id"]),
+            fps=float(archive["fps"]),
+            num_frames=int(np.asarray(archive["valid_mask"]).shape[0]),
+            labels=labels,
+            subject_id=(
+                str(archive["subject_id"]) if "subject_id" in archive.files else ""
+            ),
+            source=str(archive["source"]) if "source" in archive.files else "",
+            scene=str(archive["scene"]) if "scene" in archive.files else "unknown",
+            polarity=(
+                str(archive["polarity"]) if "polarity" in archive.files else "unknown"
+            ),
+            metadata={
+                key.removeprefix("meta_"): archive[key].item()
+                if archive[key].shape == ()
+                else archive[key]
+                for key in archive.files
+                if key.startswith("meta_")
+            },
+        )
+
+
 def sequence_summary(record: SequenceRecord) -> dict[str, Any]:
     summary = {
         "video_id": record.video_id,

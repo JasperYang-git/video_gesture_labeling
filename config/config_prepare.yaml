@@ -37,6 +37,10 @@ audit:
   min_class_detection_threshold: 0.0
   exclude_unknown_scenes: true
 
+stats:
+  processed_dir: data/processed
+  output_dir: data/stats
+
 manifest:
   enabled_in_all: false
   name: all5

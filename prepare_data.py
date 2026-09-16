@@ -29,6 +29,13 @@ from utils.preprocessing.manifest import (
     ManifestConfig,
     build_experiment_manifest,
 )
+from utils.preprocessing.stats import (
+    GroupStats,
+    build_groups,
+    collect_group_stats,
+    render_group_stats,
+    write_stats_outputs,
+)
 from utils.preprocessing.status import status_summary, write_status_jsonl
 from utils.preprocessing.tracks import (
     TrackConfig,
@@ -38,7 +45,17 @@ from utils.preprocessing.tracks import (
 from utils.trainer import seed_everything
 
 
-STAGES = ("inventory", "preview", "extract", "assemble", "audit", "manifest", "all", "mock")
+STAGES = (
+    "inventory",
+    "preview",
+    "extract",
+    "assemble",
+    "audit",
+    "stats",
+    "manifest",
+    "all",
+    "mock",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -260,6 +277,26 @@ def _run_audit(
     )
 
 
+def _run_stats(
+    config: dict[str, Any],
+    args: argparse.Namespace,
+) -> list[GroupStats]:
+    section = dict(config.get("stats", {}))
+    groups = build_groups(
+        section.get("processed_dir", "data/processed"),
+        args.sources,
+    )
+    collected = [collect_group_stats(group) for group in groups]
+    for stats in collected:
+        print()
+        print(render_group_stats(stats))
+    json_path, csv_path = write_stats_outputs(
+        section.get("output_dir", "data/stats"), collected
+    )
+    print(f"\nWrote {json_path} and {csv_path}")
+    return collected
+
+
 def _run_manifest(
     config: dict[str, Any],
     args: argparse.Namespace,
@@ -293,6 +330,10 @@ def main() -> None:
 
     if args.stage == "inventory":
         _run_inventory(config, args)
+        return
+    if args.stage == "stats":
+        # Reads only assembled sequences, so it needs no inventory.
+        _run_stats(config, args)
         return
     entries = (
         _run_inventory(config, args)

@@ -19,8 +19,67 @@ from utils.schema import (
     FEATURE_NAMES,
     SequenceRecord,
     load_sequence,
+    load_sequence_header,
     save_sequence,
 )
+
+
+class SequenceHeaderTests(unittest.TestCase):
+    def _record(self, labels: np.ndarray | None) -> SequenceRecord:
+        frames = 24
+        return SequenceRecord(
+            features=np.random.default_rng(0)
+            .standard_normal((FEATURE_DIM, frames))
+            .astype(np.float32),
+            labels=labels,
+            valid_mask=np.ones(frames, dtype=np.float32),
+            video_id="header",
+            fps=15.0,
+            subject_id="S9",
+            source="data_demo",
+            scene="sit",
+            polarity="positive",
+            metadata={"detection_rate": 0.75, "quality_passed": True},
+        )
+
+    def test_header_agrees_with_the_full_loader(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "header.npz"
+            save_sequence(path, self._record(np.arange(24, dtype=np.int64) % 3))
+
+            full = load_sequence(path)
+            header = load_sequence_header(path)
+
+            self.assertEqual(header.video_id, full.video_id)
+            self.assertEqual(header.num_frames, full.num_frames)
+            self.assertEqual(header.fps, full.fps)
+            self.assertEqual(header.subject_id, full.subject_id)
+            self.assertEqual(header.source, full.source)
+            self.assertEqual(header.scene, full.scene)
+            self.assertEqual(header.polarity, full.polarity)
+            self.assertEqual(header.metadata, full.metadata)
+            np.testing.assert_array_equal(header.labels, full.labels)
+
+    def test_header_handles_unlabeled_sequences(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "unlabeled.npz"
+            save_sequence(path, self._record(None))
+
+            header = load_sequence_header(path)
+
+            self.assertIsNone(header.labels)
+            self.assertEqual(header.num_frames, 24)
+
+    def test_header_rejects_a_foreign_feature_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "stale.npz"
+            save_sequence(path, self._record(None))
+            payload = dict(np.load(path, allow_pickle=True))
+            payload["feature_names"] = np.asarray(["bogus"])
+            np.savez_compressed(path, **payload)
+
+            with self.assertRaises(ValueError):
+                load_sequence_header(path)
 
 
 class FeatureSchemaTests(unittest.TestCase):
