@@ -18,7 +18,12 @@ from utils.metrics import (
 )
 from utils.mock_data import generate_mock_sequence
 from utils.schema import FEATURE_DIM, NUM_CLASSES
-from utils.trainer import make_class_weights, multi_stage_loss, tmse_loss
+from utils.trainer import (
+    build_scheduler,
+    make_class_weights,
+    multi_stage_loss,
+    tmse_loss,
+)
 
 
 class ModelAndMetricsTests(unittest.TestCase):
@@ -189,6 +194,73 @@ class ClassWeightTests(unittest.TestCase):
     def test_rejects_ratio_below_one(self) -> None:
         with self.assertRaises(ValueError):
             make_class_weights([0, 1], torch.device("cpu"), max_ratio=0.5)
+
+
+class SchedulerTests(unittest.TestCase):
+    BASE_LR = 1e-3
+
+    def _optimizer(self) -> torch.optim.Optimizer:
+        parameter = torch.zeros(1, requires_grad=True)
+        parameter.grad = torch.zeros(1)
+        return torch.optim.AdamW([parameter], lr=self.BASE_LR)
+
+    def _trace(self, config: dict, num_epochs: int) -> list[float]:
+        """Learning rate seen by each epoch, stepping the way train_script does."""
+        optimizer = self._optimizer()
+        scheduler = build_scheduler(optimizer, config, num_epochs)
+        rates = []
+        for _ in range(num_epochs):
+            rates.append(float(optimizer.param_groups[0]["lr"]))
+            optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
+        return rates
+
+    def test_absent_section_means_a_constant_rate(self) -> None:
+        self.assertIsNone(build_scheduler(self._optimizer(), {}, 10))
+        self.assertEqual(self._trace({}, 4), [self.BASE_LR] * 4)
+
+    def test_warmup_ramps_then_cosine_decays_to_the_floor(self) -> None:
+        config = {
+            "scheduler": {
+                "name": "cosine",
+                "warmup_epochs": 3,
+                "warmup_start_factor": 0.1,
+                "min_lr_ratio": 0.01,
+            }
+        }
+
+        rates = self._trace(config, 50)
+
+        self.assertAlmostEqual(rates[0], self.BASE_LR * 0.1)
+        self.assertAlmostEqual(rates[3], self.BASE_LR)
+        self.assertEqual(rates[:4], sorted(rates[:4]))
+        self.assertEqual(rates[3:], sorted(rates[3:], reverse=True))
+        # T_max lands on epoch 50, one past the last trained epoch, so the final
+        # rate sits just above the floor rather than exactly on it.
+        floor = self.BASE_LR * 0.01
+        self.assertGreater(rates[-1], floor)
+        self.assertLess(rates[-1], floor * 1.5)
+
+    def test_zero_warmup_starts_at_the_base_rate(self) -> None:
+        config = {"scheduler": {"name": "cosine", "warmup_epochs": 0}}
+
+        rates = self._trace(config, 5)
+
+        self.assertAlmostEqual(rates[0], self.BASE_LR)
+        self.assertEqual(rates, sorted(rates, reverse=True))
+
+    def test_rejects_unknown_name_and_out_of_range_values(self) -> None:
+        for section in (
+            {"name": "plateau"},
+            {"name": "cosine", "warmup_epochs": -1},
+            {"name": "cosine", "warmup_epochs": 10},
+            {"name": "cosine", "min_lr_ratio": 1.5},
+            {"name": "cosine", "warmup_start_factor": 0.0},
+        ):
+            with self.subTest(section=section):
+                with self.assertRaises(ValueError):
+                    build_scheduler(self._optimizer(), {"scheduler": section}, 10)
 
 
 if __name__ == "__main__":

@@ -66,6 +66,65 @@ def make_class_weights(
     return torch.tensor(weights, dtype=torch.float32, device=device)
 
 
+DEFAULT_WARMUP_START_FACTOR = 0.1
+DEFAULT_MIN_LR_RATIO = 0.01
+
+
+def build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    training_config: dict[str, Any],
+    num_epochs: int,
+) -> torch.optim.lr_scheduler.LRScheduler | None:
+    """Per-epoch learning-rate schedule, or ``None`` when none is configured.
+
+    Cosine annealing needs the full epoch budget up front, so ``T_max`` is tied
+    to ``num_epochs``; shortening a run without shortening the schedule would
+    stop it mid-decay and lose the low-rate epochs that make the final
+    checkpoints comparable.
+    """
+    section = training_config.get("scheduler")
+    if not section:
+        return None
+    name = str(section.get("name", "cosine")).strip().lower()
+    if name != "cosine":
+        raise ValueError(f"Unknown scheduler '{name}'; supported: cosine")
+
+    warmup_epochs = int(section.get("warmup_epochs", 0))
+    if warmup_epochs < 0:
+        raise ValueError("scheduler.warmup_epochs must be non-negative")
+    if warmup_epochs >= num_epochs:
+        raise ValueError(
+            f"scheduler.warmup_epochs ({warmup_epochs}) must be below "
+            f"num_epochs ({num_epochs})"
+        )
+    min_lr_ratio = float(section.get("min_lr_ratio", DEFAULT_MIN_LR_RATIO))
+    if not 0.0 <= min_lr_ratio <= 1.0:
+        raise ValueError("scheduler.min_lr_ratio must be in [0, 1]")
+    start_factor = float(
+        section.get("warmup_start_factor", DEFAULT_WARMUP_START_FACTOR)
+    )
+    if not 0.0 < start_factor <= 1.0:
+        raise ValueError("scheduler.warmup_start_factor must be in (0, 1]")
+
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=num_epochs - warmup_epochs,
+        eta_min=float(optimizer.defaults["lr"]) * min_lr_ratio,
+    )
+    if warmup_epochs == 0:
+        return cosine
+    warmup = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=start_factor,
+        total_iters=warmup_epochs,
+    )
+    return torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup, cosine],
+        milestones=[warmup_epochs],
+    )
+
+
 def tmse_loss(
     logits: torch.Tensor,
     valid_mask: torch.Tensor,

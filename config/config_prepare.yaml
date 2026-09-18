@@ -40,6 +40,9 @@ audit:
 stats:
   processed_dir: data/processed
   output_dir: data/stats
+  # Segment lengths are reported against this window so the report shows how
+  # many segments training would have to truncate.
+  window_size: 60
 
 manifest:
   enabled_in_all: false

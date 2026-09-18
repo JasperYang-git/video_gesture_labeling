@@ -24,6 +24,7 @@ from utils.schema import (
 from utils.split import manifest_sha256
 from utils.trainer import (
     DEFAULT_CLASS_WEIGHT_MAX_RATIO,
+    build_scheduler,
     evaluate,
     evaluate_full_videos,
     make_class_weights,
@@ -109,6 +110,12 @@ def main() -> None:
         lr=float(training_config["learning_rate"]),
         weight_decay=float(training_config["weight_decay"]),
     )
+    num_epochs = int(training_config["num_epochs"])
+    scheduler = build_scheduler(optimizer, training_config, num_epochs)
+    logger.info(
+        "Scheduler: %s",
+        training_config.get("scheduler") or "none (constant learning rate)",
+    )
 
     history: list[dict[str, float]] = []
     best_score = -1.0
@@ -146,9 +153,12 @@ def main() -> None:
     )
     manifest_hash = manifest_sha256(config["data"]["manifest_path"])
 
-    for epoch in range(1, int(training_config["num_epochs"]) + 1):
+    for epoch in range(1, num_epochs + 1):
         if hasattr(train_loader.dataset, "set_epoch"):
             train_loader.dataset.set_epoch(epoch)
+        # Read before stepping the scheduler so the log records the rate this
+        # epoch actually trained with.
+        learning_rate = float(optimizer.param_groups[0]["lr"])
         train_loss, train_accuracy = train_one_epoch(
             model,
             train_loader,
@@ -184,9 +194,10 @@ def main() -> None:
         selection_score = float(full_metrics[checkpoint_metric])
         selection_tiebreaker = float(full_metrics["edit"])
         logger.info(
-            "Epoch %03d | train_loss=%.6f | train_acc=%.2f%% | "
+            "Epoch %03d | lr=%.2e | train_loss=%.6f | train_acc=%.2f%% | "
             "val_loss=%.6f | val_acc=%.2f%% | full_%s=%.4f | edit=%.2f",
             epoch,
+            learning_rate,
             train_loss,
             100.0 * train_accuracy,
             validation_loss,
@@ -198,6 +209,7 @@ def main() -> None:
         history.append(
             {
                 "epoch": epoch,
+                "learning_rate": learning_rate,
                 "train_loss": train_loss,
                 "train_accuracy": train_accuracy,
                 "validation_loss": validation_loss,
@@ -244,6 +256,8 @@ def main() -> None:
             best_tiebreaker = selection_tiebreaker
             save_checkpoint(best_path, checkpoint)
             logger.info("Saved new best checkpoint: %s", best_path)
+        if scheduler is not None:
+            scheduler.step()
 
     (run_dir / "history.json").write_text(
         json.dumps(history, indent=2) + "\n",

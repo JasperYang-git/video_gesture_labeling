@@ -25,10 +25,16 @@ model:
     num_classes: 15
 
 training:
-  batch_size: 8
-  learning_rate: 0.0005
+  batch_size: 64
+  learning_rate: 0.0015
   weight_decay: 0.0001
-  num_epochs: 8
+  num_epochs: 50
+  scheduler:
+    # T_max follows num_epochs, so the two must be changed together.
+    name: cosine
+    warmup_epochs: 3
+    warmup_start_factor: 0.1
+    min_lr_ratio: 0.01
   gradient_clip_norm: 5.0
   class_weighted_loss: true
   class_weight_max_ratio: 50.0

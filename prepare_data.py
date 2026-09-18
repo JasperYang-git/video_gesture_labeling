@@ -30,6 +30,7 @@ from utils.preprocessing.manifest import (
     build_experiment_manifest,
 )
 from utils.preprocessing.stats import (
+    DEFAULT_WINDOW_SIZE,
     GroupStats,
     build_groups,
     collect_group_stats,
@@ -76,6 +77,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Pilot limit per source, applied after deterministic sorting",
+    )
+    parser.add_argument(
+        "--window-size",
+        type=int,
+        default=None,
+        help="Override stats.window_size when reporting segment lengths",
     )
     parser.add_argument(
         "--workers",
@@ -286,7 +293,12 @@ def _run_stats(
         section.get("processed_dir", "data/processed"),
         args.sources,
     )
-    collected = [collect_group_stats(group) for group in groups]
+    window_size = int(
+        args.window_size
+        if args.window_size is not None
+        else section.get("window_size", DEFAULT_WINDOW_SIZE)
+    )
+    collected = [collect_group_stats(group, window_size) for group in groups]
     for stats in collected:
         print()
         print(render_group_stats(stats))
