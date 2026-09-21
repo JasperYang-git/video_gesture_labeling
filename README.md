@@ -163,11 +163,12 @@ new_videos/
 │   ├── NOVA project/gestures.annotation~    # 预测标注
 │   ├── gestures_timeline.png                # 时间轴条带图
 │   ├── gestures.srt
+│   ├── handedness_preview/                  # 仅追踪质量低时
 │   └── ..._pred.mp4                         # 仅 --mux
 └── DG2026091502_F_R_walk/
     ├── NOVA project/gestures.annotation~    # 人工真值，不会被动
     ├── NOVA project/gestures.pred.annotation~
-    └── gestures_timeline.png                # 预测 / 真值 / 错误 三行
+    └── gestures_timeline.png                # 预测 / 追踪 / 真值 / 错误 四行
 ```
 
 ### 怎么看结果
@@ -180,6 +181,35 @@ mp4（`--mux`），或者用播放器手动挂载 `gestures.srt`。
 标注文件每行是 `起始秒;结束秒;类别id;置信度;`，与训练数据同格式，可以直接用 NOVA
 打开修正后当训练数据用。置信度是该片段内预测类别的 softmax 均值，按它排序能快速
 挑出最该人工复核的片段。
+
+### 结果差的时候，先分清是抽取问题还是模型问题
+
+这是最容易搞错的地方：MediaPipe 没抓到手的时间段，特征会退化成冻结的上一帧坐标，
+模型在那里输出什么都不奇怪，怪模型没有意义。时间轴图的 **tracking 行**就是为此存在的，
+它紧贴在预测行下面：深灰表示手被稳定追踪（越深置信度越高），**橙色表示这一段完全没
+追踪到手**。把错误行和 tracking 行竖着对齐看：
+
+- 错误区间压在橙色上 → 抽取问题，换角度重拍比调模型有用
+- 手追得好的区间里仍然判错 → 这才是模型的问题
+- 预测很碎但 tracking 全程正常 → 边界抖动，属于后处理/平滑问题
+
+整批视频的横向比较看 `quality_report.csv`（按 `detection_rate` 升序，最差的在最上面）。
+运行结束时日志会汇总低于 `quality_threshold`（默认 0.6，与训练侧 `audit.quality_threshold`
+同口径）的视频清单。注意这条线在训练时是用来**筛掉**视频的，所以低于它的测试视频，
+本来就不是训练分布里的东西。
+
+`detection_rate` 低于 `preview_threshold`（默认 0.8）时，会在样本目录下生成
+`handedness_preview/`：从**最长的丢手区间**里均匀抽帧，叠加关键点和置信度画出来，
+另外附两帧追踪正常的作对照。绿色是认出了指定的物理手，红色是 NOT FOUND。这是唯一
+能分辨"手被遮挡"、"手出画"和"拍到的是另一只手"的手段，对判断拍摄角度可不可用最直接。
+这一步要重新解码视频并跑 MediaPipe，每个视频多几秒，所以才设阈值触发；它失败不会影响
+已经产出的标注。
+
+四个质量指标的含义：`detection_rate` 是以 ≥0.7 置信度认出指定物理手的帧占比；
+`longest_missing_seconds` 是最长一段连续丢手时长（一个手势约 0.75 秒，超过就意味着
+整个动作可能丢了）；`palm_outlier_rate` 高说明手忽远忽近或检测框跳变；
+`trajectory_jump_rate` 高说明轨迹在跳，常见于误检到别人的手，该值只在
+`trajectory_jump_reliable` 为真时有意义。
 
 ### 两条安全机制
 

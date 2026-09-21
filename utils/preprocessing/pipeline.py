@@ -243,6 +243,51 @@ def _select_hand(
     return best
 
 
+MIN_JUMP_SAMPLES = 10
+
+
+def _trajectory_jump_rate(
+    coords: np.ndarray,
+    palms: np.ndarray,
+    mask: np.ndarray,
+) -> tuple[float, bool]:
+    """Rate of implausible frame-to-frame landmark jumps, with the degenerate cases out.
+
+    Three details matter and each one was a real source of nonsense numbers:
+
+    - Frames without a hand carry the previous coordinates forward, so their
+      displacement is exactly zero. Once more than half the frames are lost the median
+      and MAD both collapse to zero, the threshold degenerates to ~1e-6, and every
+      moving frame counts as a jump, making this metric a noisy copy of the detection
+      rate. Only consecutive pairs where both frames are valid are used.
+    - Coordinates are wrist-centered but not yet palm-normalised, so a hand moving
+      toward the camera scales every landmark up and inflates the displacement.
+      Dividing by the median palm size makes the metric scale-free; arm translation is
+      already cancelled by the wrist centering.
+    - A very smooth trajectory drives MAD to zero, which would flag roughly half the
+      frames. The MAD floor therefore carries a relative term.
+    """
+    valid = np.asarray(mask, dtype=bool)
+    if len(coords) < 2:
+        return 0.0, False
+    pair_valid = valid[:-1] & valid[1:]
+    if not pair_valid.any():
+        return 0.0, False
+
+    finite_palms = palms[np.isfinite(palms) & (palms > 1e-3)]
+    scale = float(np.median(finite_palms)) if len(finite_palms) else 1.0
+    scale = max(scale, 1e-3)
+
+    deltas = np.linalg.norm(np.diff(coords, axis=0), axis=1)[pair_valid] / scale
+    if deltas.size < MIN_JUMP_SAMPLES:
+        return 0.0, False
+
+    median_jump = float(np.median(deltas))
+    mad = float(np.median(np.abs(deltas - median_jump)))
+    threshold = median_jump + 6.0 * max(mad, 0.1 * median_jump, 1e-6)
+    return float((deltas > threshold).mean()), True
+
+
 def compute_quality_audit(
     centered_coordinates: np.ndarray,
     palm_sizes: np.ndarray,
@@ -284,14 +329,9 @@ def compute_quality_audit(
     else:
         palm_outlier_rate = 1.0
 
-    if len(coords) > 1:
-        jumps = np.linalg.norm(np.diff(coords, axis=0), axis=1)
-        median_jump = float(np.median(jumps))
-        mad = float(np.median(np.abs(jumps - median_jump)))
-        threshold = median_jump + 6.0 * max(mad, 1e-6)
-        trajectory_jump_rate = float((jumps > threshold).mean())
-    else:
-        trajectory_jump_rate = 0.0
+    trajectory_jump_rate, trajectory_jump_reliable = _trajectory_jump_rate(
+        coords, palms, mask
+    )
     return {
         "detection_rate": detection_rate,
         "per_class_detection_rate": per_class,
@@ -301,6 +341,7 @@ def compute_quality_audit(
         "longest_missing_seconds": float(longest_missing / fps),
         "palm_outlier_rate": palm_outlier_rate,
         "trajectory_jump_rate": trajectory_jump_rate,
+        "trajectory_jump_reliable": trajectory_jump_reliable,
     }
 
 

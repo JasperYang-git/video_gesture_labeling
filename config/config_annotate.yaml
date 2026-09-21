@@ -40,4 +40,11 @@ outputs:
   # Never clobber a hand-made gestures.annotation~; predictions land next to it as
   # gestures.pred.annotation~ unless this is turned on.
   overwrite_annotation: false
+  write_quality_report: true
+  # Same gate the training pipeline uses to reject videos (config_prepare.yaml
+  # audit.quality_threshold), so the two are directly comparable. Inference only warns.
+  quality_threshold: 0.6
+  # Below this, dump annotated frames from the worst tracking gap so the camera angle
+  # and occlusion can be judged by eye. Costs a few seconds per video.
+  preview_threshold: 0.8
   root_dir: outputs/annotate_results

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,23 +8,31 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from annotate_videos import (
+    annotation_output_path,
+    forget_self_annotations,
+    is_self_written,
+    quality_metrics,
+    write_prediction_marker,
+    write_quality_report,
+)
 from utils.preprocessing.annotations import (
     intervals_from_prediction,
     labels_from_intervals,
     parse_nova_annotation,
     write_nova_annotation,
 )
-from annotate_videos import (
-    annotation_output_path,
-    forget_self_annotations,
-    is_self_written,
-    write_prediction_marker,
-)
 from utils.preprocessing.assemble import AssembleConfig, assemble_entry
 from utils.preprocessing.inventory import InventoryEntry, scan_video_root
-from utils.preprocessing.tracks import TrackConfig, save_track, track_cache_path
-from utils.schema import BACKGROUND_ID, load_sequence
+from utils.preprocessing.tracks import (
+    TrackConfig,
+    lost_tracking_positions,
+    save_track,
+    track_cache_path,
+)
+from utils.schema import BACKGROUND_ID, FEATURE_DIM, SequenceRecord, load_sequence
 from utils.subtitles import format_timestamp, segments_to_srt
+from utils.timeline import render_timeline
 
 
 def make_prediction() -> np.ndarray:
@@ -201,6 +210,116 @@ class ScanVideoRootTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             with self.assertRaises(FileNotFoundError):
                 scan_video_root(Path(temp_dir) / "absent")
+
+
+class TimelineTests(unittest.TestCase):
+    def test_tracking_row_is_added_only_with_a_valid_mask(self) -> None:
+        prediction = make_prediction()
+        valid_mask = np.ones(len(prediction), dtype=np.float32)
+        valid_mask[20:35] = 0.0
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plain = render_timeline(
+                Path(temp_dir) / "plain.png", prediction, 15.0, title="plain"
+            )
+            with_quality = render_timeline(
+                Path(temp_dir) / "quality.png",
+                prediction,
+                15.0,
+                valid_mask=valid_mask,
+                tracking_quality=np.full(len(prediction), 0.9, dtype=np.float32),
+                title="quality",
+            )
+            self.assertTrue(plain.is_file())
+            self.assertTrue(with_quality.is_file())
+            # The extra band makes the figure taller; this is the cheapest proxy for
+            # "a row was actually drawn" without parsing the PNG.
+            self.assertGreater(
+                with_quality.stat().st_size, 0
+            )
+            self.assertGreater(
+                imagesize_height(with_quality), imagesize_height(plain)
+            )
+
+    def test_length_mismatch_is_rejected(self) -> None:
+        prediction = make_prediction()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaises(ValueError):
+                render_timeline(
+                    Path(temp_dir) / "bad.png",
+                    prediction,
+                    15.0,
+                    valid_mask=np.ones(len(prediction) - 1, dtype=np.float32),
+                )
+
+    def test_lost_tracking_positions_target_the_worst_gap(self) -> None:
+        valid = np.ones(100, dtype=np.float32)
+        valid[10:14] = 0.0  # short gap
+        valid[40:70] = 0.0  # longest gap
+        positions = lost_tracking_positions(valid, lost_count=4, valid_count=2)
+
+        in_worst_gap = [p for p in positions if 40 <= p < 70]
+        self.assertEqual(len(in_worst_gap), 4)
+        # Controls come from tracked frames so the two can be compared side by side.
+        controls = [p for p in positions if valid[p] > 0.5]
+        self.assertEqual(len(controls), 2)
+        self.assertEqual(positions, sorted(positions))
+
+    def test_lost_tracking_positions_without_any_gap(self) -> None:
+        positions = lost_tracking_positions(np.ones(50, dtype=np.float32))
+        self.assertTrue(positions)
+        self.assertEqual(len(positions), 2)
+
+
+def imagesize_height(path: Path) -> int:
+    """Read the pixel height straight out of the PNG IHDR chunk."""
+    data = path.read_bytes()
+    return int.from_bytes(data[20:24], "big")
+
+
+class QualityReportTests(unittest.TestCase):
+    def make_record(self, frames: int, detection_rate: float) -> SequenceRecord:
+        valid = np.zeros(frames, dtype=np.float32)
+        valid[: int(frames * detection_rate)] = 1.0
+        return SequenceRecord(
+            features=np.zeros((FEATURE_DIM, frames), dtype=np.float32),
+            labels=None,
+            valid_mask=valid,
+            video_id="vid",
+            fps=15.0,
+            metadata={
+                "detection_rate": detection_rate,
+                "longest_missing_seconds": 3.5,
+                "palm_outlier_rate": 0.01,
+                "trajectory_jump_rate": 0.02,
+                "trajectory_jump_reliable": True,
+            },
+        )
+
+    def test_quality_passed_follows_the_threshold(self) -> None:
+        good = quality_metrics(self.make_record(100, 0.9), threshold=0.6)
+        bad = quality_metrics(self.make_record(100, 0.4), threshold=0.6)
+        self.assertTrue(good["quality_passed"])
+        self.assertFalse(bad["quality_passed"])
+        self.assertAlmostEqual(bad["longest_missing_seconds"], 3.5)
+
+    def test_detection_rate_falls_back_to_the_mask(self) -> None:
+        record = self.make_record(100, 0.75)
+        record.metadata.pop("detection_rate")
+        metrics = quality_metrics(record, threshold=0.6)
+        self.assertAlmostEqual(metrics["detection_rate"], 0.75)
+        self.assertTrue(metrics["quality_passed"])
+
+    def test_report_is_sorted_worst_first(self) -> None:
+        rows = [
+            {"video_id": "good", "detection_rate": 0.95, "quality_passed": True},
+            {"video_id": "worst", "detection_rate": 0.31, "quality_passed": False},
+            {"video_id": "mid", "detection_rate": 0.62, "quality_passed": True},
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = write_quality_report(Path(temp_dir) / "quality_report.csv", rows)
+            table = list(csv.reader(path.open(encoding="utf-8")))
+        self.assertEqual(table[0][0], "video_id")
+        self.assertEqual([row[0] for row in table[1:]], ["worst", "mid", "good"])
 
 
 class AnnotationTargetTests(unittest.TestCase):

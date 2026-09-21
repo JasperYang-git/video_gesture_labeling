@@ -90,6 +90,9 @@ def audit_inventory(
                 "trajectory_jump_rate": metadata.get(
                     "trajectory_jump_rate", ""
                 ),
+                "trajectory_jump_reliable": bool(
+                    metadata.get("trajectory_jump_reliable", False)
+                ),
                 "scene_valid": scene_valid,
                 "quality_passed": passed,
                 "status": "passed" if passed else "rejected",

@@ -76,6 +76,82 @@ class PipelineV2Tests(unittest.TestCase):
         self.assertEqual(audit["min_class_id"], "0")
         self.assertEqual(audit["longest_missing_frames"], 1)
 
+    def make_moving_track(
+        self,
+        frames: int,
+        valid: np.ndarray,
+        step: float = 0.01,
+        palm: float = 1.0,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Steady motion while tracked, frozen coordinates while the hand is lost."""
+        coords = np.zeros((frames, COORD_DIM), dtype=np.float32)
+        position = 0.0
+        for index in range(frames):
+            if index > 0 and valid[index] > 0.5:
+                position += step
+            coords[index, 0] = position
+        return coords * palm, np.full(frames, palm, dtype=np.float32)
+
+    def test_jump_rate_ignores_frozen_frames_from_lost_tracking(self) -> None:
+        # Losing more than half the frames collapses the median and MAD of the raw
+        # jumps to zero, which drops the threshold to ~1e-6 so every moving frame
+        # counts. The metric then just mirrors the detection rate, which is what the
+        # real runs showed (0.460/0.460, 0.469/0.469, ...).
+        frames = 200
+        valid = np.zeros(frames, dtype=np.float32)
+        valid[::5] = 1.0
+        valid[1::5] = 1.0  # 40 percent tracked, in consecutive pairs
+        coords, palms = self.make_moving_track(frames, valid)
+
+        raw_jumps = np.linalg.norm(np.diff(coords, axis=0), axis=1)
+        raw_median = float(np.median(raw_jumps))
+        raw_mad = float(np.median(np.abs(raw_jumps - raw_median)))
+        degenerate_rate = float(
+            (raw_jumps > raw_median + 6.0 * max(raw_mad, 1e-6)).mean()
+        )
+
+        audit = compute_quality_audit(coords, palms, valid, None, fps=30.0)
+        self.assertAlmostEqual(degenerate_rate, audit["detection_rate"], places=2)
+        self.assertTrue(audit["trajectory_jump_reliable"])
+        self.assertLess(audit["trajectory_jump_rate"], 0.05)
+
+    def test_jump_rate_unmeasurable_without_consecutive_tracked_frames(self) -> None:
+        frames = 200
+        valid = np.zeros(frames, dtype=np.float32)
+        valid[::3] = 1.0  # tracked frames never land back to back
+        coords, palms = self.make_moving_track(frames, valid)
+        audit = compute_quality_audit(coords, palms, valid, None, fps=30.0)
+        self.assertFalse(audit["trajectory_jump_reliable"])
+
+    def test_jump_rate_is_invariant_to_hand_distance(self) -> None:
+        frames = 120
+        valid = np.ones(frames, dtype=np.float32)
+        near_coords, near_palms = self.make_moving_track(frames, valid, palm=4.0)
+        far_coords, far_palms = self.make_moving_track(frames, valid, palm=0.5)
+
+        near = compute_quality_audit(near_coords, near_palms, valid, None, fps=30.0)
+        far = compute_quality_audit(far_coords, far_palms, valid, None, fps=30.0)
+        self.assertAlmostEqual(
+            near["trajectory_jump_rate"], far["trajectory_jump_rate"], places=6
+        )
+
+    def test_jump_rate_still_catches_a_teleporting_landmark(self) -> None:
+        frames = 120
+        valid = np.ones(frames, dtype=np.float32)
+        coords, palms = self.make_moving_track(frames, valid)
+        coords[60, 0] += 50.0  # landmark snaps onto a different hand for one frame
+        audit = compute_quality_audit(coords, palms, valid, None, fps=30.0)
+        self.assertGreater(audit["trajectory_jump_rate"], 0.0)
+
+    def test_jump_rate_is_flagged_unreliable_without_enough_valid_pairs(self) -> None:
+        frames = 40
+        valid = np.zeros(frames, dtype=np.float32)
+        valid[:4] = 1.0
+        coords, palms = self.make_moving_track(frames, valid)
+        audit = compute_quality_audit(coords, palms, valid, None, fps=30.0)
+        self.assertFalse(audit["trajectory_jump_reliable"])
+        self.assertEqual(audit["trajectory_jump_rate"], 0.0)
+
     def test_non_integer_fps_features_and_labels_stay_aligned(self) -> None:
         frames = 101
         coordinates = np.zeros((frames, COORD_DIM), dtype=np.float32)

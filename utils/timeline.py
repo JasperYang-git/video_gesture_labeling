@@ -11,6 +11,9 @@ from utils.schema import BACKGROUND_ID, CLASS_NAMES, NUM_CLASSES
 BACKGROUND_COLOR = (0.92, 0.92, 0.92)
 ERROR_COLOR = (0.85, 0.12, 0.12)
 MATCH_COLOR = (0.96, 0.96, 0.96)
+# Frames where MediaPipe lost the hand: the model only sees a frozen trajectory there,
+# so they must stand out rather than blend into the grey confidence ramp.
+LOST_TRACKING_COLOR = (0.95, 0.65, 0.15)
 
 
 def class_colors() -> dict[int, tuple[float, float, float]]:
@@ -37,14 +40,47 @@ def _label_strip(
     return strip
 
 
+def _tracking_strip(
+    valid_mask: np.ndarray,
+    tracking_quality: np.ndarray | None,
+) -> np.ndarray:
+    """Grey ramp for MediaPipe confidence, with lost frames painted in a warning color."""
+    valid = np.asarray(valid_mask) > 0.5
+    if tracking_quality is None:
+        shade = np.where(valid, 0.35, 1.0).astype(np.float32)
+    else:
+        quality = np.clip(np.asarray(tracking_quality, dtype=np.float32), 0.0, 1.0)
+        # High confidence renders dark, low confidence light, so a washed-out band
+        # reads as "MediaPipe was unsure here" without needing the legend.
+        shade = 0.85 - 0.6 * quality
+    strip = np.repeat(shade[:, np.newaxis], 3, axis=1).astype(np.float32)
+    strip[~valid] = LOST_TRACKING_COLOR
+    return strip
+
+
+def _longest_gap_seconds(valid_mask: np.ndarray, fps: float) -> float:
+    longest = current = 0
+    for is_valid in np.asarray(valid_mask) > 0.5:
+        current = 0 if is_valid else current + 1
+        longest = max(longest, current)
+    return longest / fps
+
+
 def render_timeline(
     output_path: str | Path,
     prediction: np.ndarray,
     fps: float,
     labels: np.ndarray | None = None,
+    valid_mask: np.ndarray | None = None,
+    tracking_quality: np.ndarray | None = None,
     title: str = "",
 ) -> Path:
-    """Render a prediction (and optionally ground truth) as horizontal color bands."""
+    """Render a prediction (and optionally ground truth and tracking quality) as bands.
+
+    The tracking row sits directly under the prediction so that "the model got this
+    stretch wrong" and "MediaPipe had no hand here" line up vertically, which is the
+    whole point: it separates an extraction failure from a classification failure.
+    """
     import matplotlib
 
     matplotlib.use("Agg")
@@ -57,9 +93,26 @@ def render_timeline(
         raise ValueError(
             f"labels {labels.shape} does not match prediction {prediction.shape}"
         )
+    if valid_mask is not None and len(valid_mask) != len(prediction):
+        raise ValueError(
+            f"valid_mask {len(valid_mask)} does not match prediction {len(prediction)}"
+        )
+    if tracking_quality is not None and len(tracking_quality) != len(prediction):
+        raise ValueError(
+            f"tracking_quality {len(tracking_quality)} does not match "
+            f"prediction {len(prediction)}"
+        )
 
     colors = class_colors()
     rows = [("prediction", _label_strip(prediction, colors))]
+    detection_rate: float | None = None
+    longest_gap: float | None = None
+    if valid_mask is not None:
+        rows.append(("tracking", _tracking_strip(valid_mask, tracking_quality)))
+        detection_rate = (
+            float(np.mean(np.asarray(valid_mask) > 0.5)) if len(valid_mask) else 0.0
+        )
+        longest_gap = _longest_gap_seconds(valid_mask, fps)
     accuracy: float | None = None
     if labels is not None:
         rows.append(("ground truth", _label_strip(labels, colors)))
@@ -98,6 +151,10 @@ def render_timeline(
         for class_id in present
         if 0 <= class_id < NUM_CLASSES
     ]
+    if valid_mask is not None and not np.all(np.asarray(valid_mask) > 0.5):
+        handles.append(
+            Patch(facecolor=LOST_TRACKING_COLOR, edgecolor="0.6", label="hand not tracked")
+        )
     if handles:
         figure.legend(
             handles=handles,
@@ -110,6 +167,10 @@ def render_timeline(
     heading = title or "timeline"
     if accuracy is not None:
         heading = f"{heading} | frame accuracy {accuracy:.3f}"
+    if detection_rate is not None:
+        heading = f"{heading} | detection {detection_rate:.2f}"
+        if longest_gap:
+            heading = f"{heading} | longest gap {longest_gap:.1f}s"
     figure.suptitle(heading, fontsize=11)
     figure.tight_layout(rect=(0.0, 0.10, 1.0, 0.97))
 

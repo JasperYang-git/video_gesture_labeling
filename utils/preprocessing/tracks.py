@@ -302,16 +302,63 @@ def extract_inventory(
     return [item for item in results if item is not None]
 
 
+def lost_tracking_positions(
+    valid_mask: np.ndarray,
+    lost_count: int = 4,
+    valid_count: int = 2,
+) -> list[int]:
+    """Frame positions that explain a low detection rate: inside the worst gap, plus controls.
+
+    Sampling uniformly across a video mostly returns frames that already work. The
+    interesting frames are the ones inside the longest stretch where MediaPipe found
+    nothing, which is where you can see whether the hand is occluded, out of frame, or
+    simply being read as the wrong hand. A couple of tracked frames come along as a
+    baseline for comparison.
+    """
+    valid = np.asarray(valid_mask) > 0.5
+    if not len(valid):
+        return []
+
+    best_start = best_length = current_start = 0
+    current_length = 0
+    for index, is_valid in enumerate(valid):
+        if is_valid:
+            current_length = 0
+            continue
+        if current_length == 0:
+            current_start = index
+        current_length += 1
+        if current_length > best_length:
+            best_start, best_length = current_start, current_length
+
+    positions: list[int] = []
+    if best_length > 0 and lost_count > 0:
+        positions.extend(
+            np.linspace(
+                best_start, best_start + best_length - 1, lost_count, dtype=int
+            ).tolist()
+        )
+    valid_indices = np.flatnonzero(valid)
+    if len(valid_indices) and valid_count > 0:
+        picks = np.linspace(0, len(valid_indices) - 1, valid_count, dtype=int)
+        positions.extend(int(valid_indices[pick]) for pick in picks)
+    return sorted(set(positions))
+
+
 def write_handedness_previews(
     entry: Any,
     config: TrackConfig,
     output_dir: str | Path,
     count: int = 6,
+    positions: list[int] | None = None,
 ) -> list[Path]:
     cv2, mp = _optional_dependencies()
     capture = cv2.VideoCapture(str(entry.video_path))
     frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    positions = np.linspace(0, max(frame_count - 1, 0), max(1, count), dtype=int)
+    if positions is None:
+        positions = np.linspace(
+            0, max(frame_count - 1, 0), max(1, count), dtype=int
+        ).tolist()
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
@@ -359,7 +406,16 @@ def write_handedness_previews(
                     (0, 0, 255),
                     2,
                 )
-            path = output_root / f"{entry.video_id}__{ordinal:02d}.jpg"
+            cv2.putText(
+                frame,
+                f"frame {int(position)}",
+                (20, 70),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2,
+            )
+            path = output_root / f"{entry.video_id}__{ordinal:02d}_f{int(position):06d}.jpg"
             cv2.imwrite(str(path), frame)
             written.append(path)
     capture.release()

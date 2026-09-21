@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import shutil
 from dataclasses import replace
@@ -38,13 +39,28 @@ from utils.preprocessing.inventory import (
     scan_video_root,
 )
 from utils.preprocessing.status import status_summary
-from utils.preprocessing.tracks import TrackConfig, extract_inventory
-from utils.schema import load_sequence
+from utils.preprocessing.tracks import (
+    TrackConfig,
+    extract_inventory,
+    load_track,
+    lost_tracking_positions,
+    track_cache_path,
+    write_handedness_previews,
+)
+from utils.schema import SCORE_INDEX, SequenceRecord, load_sequence
 from utils.subtitles import mux_subtitles, write_srt
 from utils.timeline import render_timeline
 from utils.trainer import resolve_device, seed_everything
 
 PREDICTED_ANNOTATION_FILE_NAME = "gestures.pred.annotation~"
+PREVIEW_DIRECTORY_NAME = "handedness_preview"
+QUALITY_KEYS = (
+    "detection_rate",
+    "longest_missing_seconds",
+    "palm_outlier_rate",
+    "trajectory_jump_rate",
+    "trajectory_jump_reliable",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -114,6 +130,66 @@ def annotation_output_path(
     return target, False
 
 
+def quality_metrics(record: SequenceRecord, threshold: float) -> dict[str, Any]:
+    """Pull the audit numbers assemble already stored in the sequence metadata."""
+    metrics: dict[str, Any] = {
+        key: record.metadata.get(key) for key in QUALITY_KEYS if key in record.metadata
+    }
+    detection_rate = metrics.get("detection_rate")
+    if detection_rate is None:
+        # Fall back to the mask itself so a sequence written before the audit existed
+        # still reports something usable.
+        detection_rate = (
+            float(np.mean(record.valid_mask > 0.5)) if record.num_frames else 0.0
+        )
+        metrics["detection_rate"] = detection_rate
+    metrics["detection_rate"] = float(detection_rate)
+    metrics["quality_passed"] = float(detection_rate) >= threshold
+    return metrics
+
+
+def write_quality_report(path: Path, rows: list[dict[str, Any]]) -> Path:
+    """Worst tracking first, because that is the list worth acting on."""
+    columns = [
+        "video_id",
+        "detection_rate",
+        "quality_passed",
+        "longest_missing_seconds",
+        "duration_sec",
+        "predicted_actions",
+        "frame_accuracy",
+        "palm_outlier_rate",
+        "trajectory_jump_rate",
+        "trajectory_jump_reliable",
+        "video_path",
+    ]
+    ordered = sorted(rows, key=lambda row: float(row.get("detection_rate") or 0.0))
+    with path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(columns)
+        for row in ordered:
+            writer.writerow(
+                [
+                    f"{row[key]:.4f}"
+                    if isinstance(row.get(key), float)
+                    else ("" if row.get(key) is None else row.get(key))
+                    for key in columns
+                ]
+            )
+    return path
+
+
+def preview_frame_positions(
+    entry: InventoryEntry,
+    track_config: TrackConfig,
+) -> list[int]:
+    """Source-fps frames worth eyeballing, read back from the cached track."""
+    cache_path = track_cache_path(track_config, entry.source, entry.video_id)
+    if not cache_path.is_file():
+        return []
+    return lost_tracking_positions(load_track(cache_path)["valid_mask"])
+
+
 def write_prediction_marker(annotation_path: Path, entry: InventoryEntry, model_path: str) -> None:
     payload = {
         "video_id": entry.video_id,
@@ -178,7 +254,10 @@ def main() -> None:
 
     overwrite = args.overwrite_annotation or bool(outputs.get("overwrite_annotation", False))
     want_mux = args.mux or bool(outputs.get("mux", False))
+    quality_threshold = float(outputs.get("quality_threshold", 0.6))
+    preview_threshold = float(outputs.get("preview_threshold", 0.8))
     index_payload: list[dict[str, Any]] = []
+    quality_rows: list[dict[str, Any]] = []
 
     for entry in entries:
         result = assembled.get(entry.video_id)
@@ -198,6 +277,7 @@ def main() -> None:
         directory = Path(entry.directory_path)
         written: dict[str, str] = {}
         intervals = intervals_from_prediction(prediction, record.fps, logits)
+        quality = quality_metrics(record, quality_threshold)
 
         if bool(outputs.get("write_annotation", True)):
             annotation_path, shadowed = annotation_output_path(entry, overwrite)
@@ -218,6 +298,8 @@ def main() -> None:
                 prediction,
                 record.fps,
                 labels=record.labels,
+                valid_mask=record.valid_mask,
+                tracking_quality=record.features[SCORE_INDEX],
                 title=entry.video_id,
             )
             written["timeline"] = str(timeline_path)
@@ -230,6 +312,33 @@ def main() -> None:
                 muxed = directory / f"{video_path.stem}{PREDICTION_VIDEO_SUFFIX}"
                 mux_subtitles(video_path, srt_path, muxed)
                 written["muxed_video"] = str(muxed)
+        if quality["detection_rate"] < preview_threshold:
+            positions = preview_frame_positions(entry, track_config)
+            if positions:
+                preview_dir = directory / PREVIEW_DIRECTORY_NAME
+                try:
+                    previews = write_handedness_previews(
+                        entry, track_config, preview_dir, positions=positions
+                    )
+                except Exception as exc:
+                    # Previews need to decode the video again and re-run MediaPipe.
+                    # They are a diagnostic extra, so a failure here must not cost the
+                    # annotation that was already produced.
+                    logger.warning(
+                        "%s | could not write handedness previews: %s: %s",
+                        entry.video_id,
+                        type(exc).__name__,
+                        exc,
+                    )
+                else:
+                    written["handedness_preview"] = str(preview_dir)
+                    logger.info(
+                        "%s | detection_rate=%.3f below %.2f; wrote %d preview frames",
+                        entry.video_id,
+                        quality["detection_rate"],
+                        preview_threshold,
+                        len(previews),
+                    )
 
         artifacts_dir = run_dir / entry.video_id
         artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -242,10 +351,11 @@ def main() -> None:
             else None
         )
         logger.info(
-            "%s | frames=%d | actions=%d%s",
+            "%s | frames=%d | actions=%d | detection=%.3f%s",
             entry.video_id,
             record.num_frames,
             len(intervals),
+            quality["detection_rate"],
             f" | frame_accuracy={accuracy:.3f}" if accuracy is not None else "",
         )
         index_payload.append(
@@ -258,13 +368,48 @@ def main() -> None:
                 "predicted_actions": len(intervals),
                 "has_ground_truth": record.labels is not None,
                 "frame_accuracy": accuracy,
+                "quality": quality,
                 "outputs": written,
+            }
+        )
+        quality_rows.append(
+            {
+                "video_id": entry.video_id,
+                "video_path": entry.video_path,
+                "duration_sec": record.num_frames / record.fps if record.fps else 0.0,
+                "predicted_actions": len(intervals),
+                "frame_accuracy": accuracy,
+                **quality,
             }
         )
 
     index_path = run_dir / "annotations.json"
     index_path.write_text(json.dumps(index_payload, indent=2) + "\n", encoding="utf-8")
     logger.info("Annotated %d/%d videos; index: %s", len(index_payload), len(entries), index_path)
+
+    if quality_rows and bool(outputs.get("write_quality_report", True)):
+        report_path = write_quality_report(run_dir / "quality_report.csv", quality_rows)
+        logger.info("Wrote %s", report_path)
+
+    low_quality = sorted(
+        (row for row in quality_rows if not row["quality_passed"]),
+        key=lambda row: row["detection_rate"],
+    )
+    if low_quality:
+        logger.warning(
+            "Low tracking quality (detection_rate < %.2f): %d/%d videos. "
+            "Predictions there say more about MediaPipe than about the model.",
+            quality_threshold,
+            len(low_quality),
+            len(quality_rows),
+        )
+        for row in low_quality:
+            logger.warning(
+                "  %-56s detection=%.3f longest_gap=%.1fs",
+                row["video_id"],
+                row["detection_rate"],
+                float(row.get("longest_missing_seconds") or 0.0),
+            )
 
 
 if __name__ == "__main__":
