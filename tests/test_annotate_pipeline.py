@@ -240,6 +240,51 @@ class TimelineTests(unittest.TestCase):
                 imagesize_height(with_quality), imagesize_height(plain)
             )
 
+    def test_filtered_row_is_added_when_postprocessing_changed_something(self) -> None:
+        prediction = make_prediction()
+        filtered = prediction.copy()
+        filtered[40:46] = BACKGROUND_ID
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plain = render_timeline(
+                Path(temp_dir) / "plain.png", prediction, 15.0, title="plain"
+            )
+            with_filtered = render_timeline(
+                Path(temp_dir) / "filtered.png",
+                prediction,
+                15.0,
+                filtered=filtered,
+                title="filtered",
+            )
+            self.assertGreater(
+                imagesize_height(with_filtered), imagesize_height(plain)
+            )
+
+    def test_all_rows_render_together(self) -> None:
+        labels = make_prediction()
+        prediction = labels.copy()
+        prediction[40:46] = 5  # the raw model output is wrong here
+        filtered = labels.copy()  # post-processing fixed it
+        valid_mask = np.ones(len(labels), dtype=np.float32)
+        valid_mask[10:18] = 0.0
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = render_timeline(
+                Path(temp_dir) / "all_rows.png",
+                prediction,
+                15.0,
+                labels=labels,
+                valid_mask=valid_mask,
+                tracking_quality=np.full(len(labels), 0.9, dtype=np.float32),
+                filtered=filtered,
+                title="all rows",
+            )
+            self.assertTrue(path.is_file())
+            full_height = imagesize_height(path)
+            minimal = render_timeline(
+                Path(temp_dir) / "minimal.png", prediction, 15.0, title="minimal"
+            )
+            # prediction + filtered + tracking + ground truth + errors, versus one row.
+            self.assertGreater(full_height, imagesize_height(minimal))
+
     def test_length_mismatch_is_rejected(self) -> None:
         prediction = make_prediction()
         with tempfile.TemporaryDirectory() as temp_dir:

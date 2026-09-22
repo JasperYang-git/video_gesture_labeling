@@ -98,13 +98,11 @@ def intervals_from_prediction(
     mean softmax probability of its predicted class so low-confidence guesses can be
     filtered before review.
     """
+    from utils.postprocess import class_probabilities
+
     if fps <= 0:
         raise ValueError("fps must be positive")
-    probabilities = None
-    if logits is not None:
-        shifted = logits - logits.max(axis=0, keepdims=True)
-        exponentiated = np.exp(shifted)
-        probabilities = exponentiated / exponentiated.sum(axis=0, keepdims=True)
+    probabilities = None if logits is None else class_probabilities(logits)
 
     intervals: list[AnnotationInterval] = []
     for segment in labels_to_segments(prediction):

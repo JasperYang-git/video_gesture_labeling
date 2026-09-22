@@ -47,7 +47,8 @@ from utils.preprocessing.tracks import (
     track_cache_path,
     write_handedness_previews,
 )
-from utils.schema import SCORE_INDEX, SequenceRecord, load_sequence
+from utils.postprocess import PostprocessConfig, apply_postprocess
+from utils.schema import SCORE_INDEX, SequenceRecord, class_id_to_name, load_sequence
 from utils.subtitles import mux_subtitles, write_srt
 from utils.timeline import render_timeline
 from utils.trainer import resolve_device, seed_everything
@@ -256,6 +257,16 @@ def main() -> None:
     want_mux = args.mux or bool(outputs.get("mux", False))
     quality_threshold = float(outputs.get("quality_threshold", 0.6))
     preview_threshold = float(outputs.get("preview_threshold", 0.8))
+    postprocess = PostprocessConfig.from_dict(config.get("postprocess"))
+    if postprocess.enabled:
+        logger.info(
+            "Post-processing enabled: allowed_classes=%s min_confidence=%.2f "
+            "min_duration_sec=%.2f (raw predictions are still saved)",
+            [class_id_to_name(class_id) for class_id in postprocess.allowed_classes]
+            or "all",
+            postprocess.min_confidence,
+            postprocess.min_duration_sec,
+        )
     index_payload: list[dict[str, Any]] = []
     quality_rows: list[dict[str, Any]] = []
 
@@ -270,9 +281,11 @@ def main() -> None:
         )
         record = load_sequence(sequence_path)
         validate_record_compatibility(record, checkpoint)
-        prediction, logits = predict_sequence(
+        raw_prediction, logits = predict_sequence(
             model, record, device, window_size, stride
         )
+        filtered = apply_postprocess(raw_prediction, logits, record.fps, postprocess)
+        prediction = filtered.prediction
 
         directory = Path(entry.directory_path)
         written: dict[str, str] = {}
@@ -295,11 +308,12 @@ def main() -> None:
             timeline_path = directory / "gestures_timeline.png"
             render_timeline(
                 timeline_path,
-                prediction,
+                raw_prediction,
                 record.fps,
                 labels=record.labels,
                 valid_mask=record.valid_mask,
                 tracking_quality=record.features[SCORE_INDEX],
+                filtered=prediction if filtered.changed else None,
                 title=entry.video_id,
             )
             written["timeline"] = str(timeline_path)
@@ -342,21 +356,38 @@ def main() -> None:
 
         artifacts_dir = run_dir / entry.video_id
         artifacts_dir.mkdir(parents=True, exist_ok=True)
-        np.save(artifacts_dir / "prediction.npy", prediction)
+        np.save(artifacts_dir / "prediction.npy", raw_prediction)
         np.save(artifacts_dir / "logits.npy", logits)
+        if filtered.changed:
+            np.save(artifacts_dir / "prediction_filtered.npy", prediction)
 
         accuracy = (
             float(np.mean(prediction == record.labels))
             if record.labels is not None
             else None
         )
+        raw_accuracy = (
+            float(np.mean(raw_prediction == record.labels))
+            if record.labels is not None
+            else None
+        )
+        accuracy_text = ""
+        if accuracy is not None:
+            accuracy_text = f" | frame_accuracy={accuracy:.3f}"
+            if filtered.changed and raw_accuracy is not None:
+                accuracy_text = (
+                    f" | frame_accuracy={raw_accuracy:.3f}->{accuracy:.3f} (filtered)"
+                )
         logger.info(
-            "%s | frames=%d | actions=%d | detection=%.3f%s",
+            "%s | frames=%d | actions=%d | detection=%.3f%s%s",
             entry.video_id,
             record.num_frames,
             len(intervals),
             quality["detection_rate"],
-            f" | frame_accuracy={accuracy:.3f}" if accuracy is not None else "",
+            accuracy_text,
+            f" | postprocess changed {sum(s['changed_frames'] for s in filtered.stages)} frames"
+            if filtered.changed
+            else "",
         )
         index_payload.append(
             {
@@ -368,7 +399,9 @@ def main() -> None:
                 "predicted_actions": len(intervals),
                 "has_ground_truth": record.labels is not None,
                 "frame_accuracy": accuracy,
+                "raw_frame_accuracy": raw_accuracy,
                 "quality": quality,
+                "postprocess": filtered.summary(),
                 "outputs": written,
             }
         )
@@ -386,6 +419,32 @@ def main() -> None:
     index_path = run_dir / "annotations.json"
     index_path.write_text(json.dumps(index_payload, indent=2) + "\n", encoding="utf-8")
     logger.info("Annotated %d/%d videos; index: %s", len(index_payload), len(entries), index_path)
+
+    if postprocess.enabled:
+        touched = [row for row in index_payload if row["postprocess"]["changed"]]
+        logger.info(
+            "Post-processing changed %d/%d videos; raw predictions kept as "
+            "prediction.npy next to prediction_filtered.npy",
+            len(touched),
+            len(index_payload),
+        )
+        scored = [
+            row
+            for row in touched
+            if row["frame_accuracy"] is not None and row["raw_frame_accuracy"] is not None
+        ]
+        if scored:
+            raw_mean = float(np.mean([row["raw_frame_accuracy"] for row in scored]))
+            filtered_mean = float(np.mean([row["frame_accuracy"] for row in scored]))
+            logger.info(
+                "Mean frame accuracy on those videos: %.3f raw -> %.3f filtered",
+                raw_mean,
+                filtered_mean,
+            )
+            if filtered_mean < raw_mean:
+                logger.warning(
+                    "Post-processing made accuracy worse; reconsider the thresholds."
+                )
 
     if quality_rows and bool(outputs.get("write_quality_report", True)):
         report_path = write_quality_report(run_dir / "quality_report.csv", quality_rows)

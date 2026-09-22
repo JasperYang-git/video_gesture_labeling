@@ -32,6 +32,23 @@ inference:
   window_size: 60
   stride: 12
 
+# Optional filters applied to the model output. All default to no-ops. They run after
+# inference only, so nothing here can cause train/test skew, and the raw prediction is
+# always saved next to the filtered one. evaluate_script.py ignores this section on
+# purpose: a class prior would hide the single-versus-double confusion worth seeing.
+postprocess:
+  # Restrict the argmax to these classes (names or ids); background is always allowed.
+  # Use only when you know it for a fact, e.g. a recording session of double gestures:
+  #   allowed_classes: [double-knock, double-tap, double-slide-up, double-slide-down, double-clench]
+  allowed_classes: []
+  # Drop action segments whose mean softmax probability is below this. Calibrate it on
+  # a labeled split rather than guessing; 15 classes means chance is 0.067.
+  min_confidence: 0.0
+  # Drop action segments shorter than this. A real gesture lasts around 0.75s, so
+  # anything near 0.2s is boundary jitter. Segments with the same class on both sides
+  # are absorbed instead of blanked, to avoid splitting one gesture into two.
+  min_duration_sec: 0.0
+
 outputs:
   write_annotation: true
   write_timeline: true

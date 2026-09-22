@@ -182,6 +182,49 @@ mp4（`--mux`），或者用播放器手动挂载 `gestures.srt`。
 打开修正后当训练数据用。置信度是该片段内预测类别的 softmax 均值，按它排序能快速
 挑出最该人工复核的片段。
 
+### 对预测结果做过滤（可选）
+
+`config_annotate.yaml` 的 `postprocess` 段提供三个过滤器，**默认全部关闭**。它们只在
+推理之后生效，不碰抽取和装配，所以不会引入任何 train/test skew；原始预测始终保存为
+`prediction.npy`，过滤后的另存为 `prediction_filtered.npy`。
+
+```yaml
+postprocess:
+  allowed_classes: []      # 先验类别约束，留空表示不限制
+  min_confidence: 0.0      # 段内平均 softmax 低于此值则丢弃
+  min_duration_sec: 0.0    # 短于此时长的动作段视为抖动
+```
+
+**`min_duration_sec` 通常最划算。** 一个真实手势约 0.75 秒，15fps 下是 11 帧左右，
+所以只有 2~3 帧的片段在物理上不可能是真动作，基本都是边界抖动。这个阈值有明确的物理
+依据，不像置信度那样需要调。注意一个细节：如果短片段**两侧是同一个类别**，它会被吸收
+进那个类别而不是抹成背景——否则把一个长动作中间挖个洞，反而会把它劈成两段，让过分割
+更严重。
+
+**`min_confidence` 要标定，不要拍脑袋。** 15 类均匀分布是 0.067，训练好的模型在清晰
+手势上通常 >0.9。具体该取 0.6 还是 0.85，应该在有标注的数据上画 precision/recall 曲线
+决定。阈值定高了会把大量正确预测一起砍掉——用一个未收敛的模型试跑时，0.3 就足以把所有
+预测清空。
+
+**`allowed_classes` 只在你确信时用。** 比如整场录制都是 double 动作：
+
+```yaml
+  allowed_classes: [double-knock, double-tap, double-slide-up, double-slide-down, double-clench]
+```
+
+实现上是**掩码 argmax** 而不是事后丢弃：不允许的类别 logits 置为负无穷后重新取 argmax，
+所以模型会退而选择它认为次好的允许类别（knock 变成 double-knock），片段保持完整，不会
+留下空洞。background 永远在允许集合里。写类别名或 id 都可以。
+
+需要强调的是，`evaluate_script.py` **完全不读这一段**。single/double 混淆恰恰是这个任务
+最该被看见的失败模式，用先验把 single 屏蔽掉会让指标虚高而掩盖真实能力。过滤只作用于
+最终呈现，评估永远跑原始预测。
+
+过滤生效时，时间轴图会在 `prediction` 行下面多一行 `filtered`，两行上下对齐，有真值时
+标题显示 `frame accuracy 0.72 -> 0.81 filtered`。如果过滤让平均准确率变差，运行结束会
+发 warning 提醒你重新考虑阈值。每个阶段改了多少帧、动作段数从几个变成几个，都记录在
+`annotations.json` 的 `postprocess` 字段里。
+
 ### 结果差的时候，先分清是抽取问题还是模型问题
 
 这是最容易搞错的地方：MediaPipe 没抓到手的时间段，特征会退化成冻结的上一帧坐标，
@@ -245,8 +288,9 @@ background，并作为受控 hard negative 采样，默认约占动作窗口数�
   `per_class_metrics.csv`（每类的帧级与段级 P/R/F1、样本量、最常被错判成哪一类）和
   `confusion_matrix.csv`。日志会按帧级 F1 从差到好打印类别表，并单独提示测试集中
   完全缺失的类别
-- 标注：`outputs/annotate_results/.../annotations.json` 索引，以及每个视频的
-  `prediction.npy` / `logits.npy`，事后复查不用重跑
+- 标注：`outputs/annotate_results/.../annotations.json` 索引、`quality_report.csv`
+  追踪质量报表，以及每个视频的 `prediction.npy` / `logits.npy`（开了后处理时另有
+  `prediction_filtered.npy`），事后复查不用重跑
 
 Checkpoint 自带模型名、参数、类别映射、manifest hash、视频列表、整视频验证指标和
 预处理 schema/fingerprint。输入数据和训练配方不兼容时，推理会明确报错。

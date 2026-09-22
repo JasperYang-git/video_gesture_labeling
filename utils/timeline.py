@@ -73,6 +73,7 @@ def render_timeline(
     labels: np.ndarray | None = None,
     valid_mask: np.ndarray | None = None,
     tracking_quality: np.ndarray | None = None,
+    filtered: np.ndarray | None = None,
     title: str = "",
 ) -> Path:
     """Render a prediction (and optionally ground truth and tracking quality) as bands.
@@ -80,6 +81,10 @@ def render_timeline(
     The tracking row sits directly under the prediction so that "the model got this
     stretch wrong" and "MediaPipe had no hand here" line up vertically, which is the
     whole point: it separates an extraction failure from a classification failure.
+
+    ``filtered`` is the post-processed prediction. It gets its own row right below the
+    raw one so a filter that removed real gestures is as obvious as one that cleaned up
+    noise; accuracy is then reported for both.
     """
     import matplotlib
 
@@ -102,9 +107,15 @@ def render_timeline(
             f"tracking_quality {len(tracking_quality)} does not match "
             f"prediction {len(prediction)}"
         )
+    if filtered is not None and filtered.shape != prediction.shape:
+        raise ValueError(
+            f"filtered {filtered.shape} does not match prediction {prediction.shape}"
+        )
 
     colors = class_colors()
     rows = [("prediction", _label_strip(prediction, colors))]
+    if filtered is not None:
+        rows.append(("filtered", _label_strip(filtered, colors)))
     detection_rate: float | None = None
     longest_gap: float | None = None
     if valid_mask is not None:
@@ -114,13 +125,19 @@ def render_timeline(
         )
         longest_gap = _longest_gap_seconds(valid_mask, fps)
     accuracy: float | None = None
+    filtered_accuracy: float | None = None
+    delivered = filtered if filtered is not None else prediction
     if labels is not None:
         rows.append(("ground truth", _label_strip(labels, colors)))
-        mismatch = prediction != labels
+        # Errors are scored against what actually ships, so a filter that helps or
+        # hurts shows up directly in this row.
+        mismatch = delivered != labels
         error_strip = np.tile(np.asarray(MATCH_COLOR, dtype=np.float32), (len(prediction), 1))
         error_strip[mismatch] = ERROR_COLOR
         rows.append(("errors", error_strip))
-        accuracy = float(np.mean(~mismatch)) if len(prediction) else 0.0
+        accuracy = float(np.mean(prediction == labels)) if len(prediction) else 0.0
+        if filtered is not None:
+            filtered_accuracy = float(np.mean(~mismatch)) if len(prediction) else 0.0
 
     duration = len(prediction) / fps
     width = float(np.clip(duration / 6.0, 8.0, 40.0))
@@ -145,6 +162,7 @@ def render_timeline(
     present = sorted(
         set(np.unique(prediction).tolist())
         | (set(np.unique(labels).tolist()) if labels is not None else set())
+        | (set(np.unique(filtered).tolist()) if filtered is not None else set())
     )
     handles = [
         Patch(facecolor=colors[class_id], edgecolor="0.6", label=CLASS_NAMES[class_id])
@@ -167,6 +185,8 @@ def render_timeline(
     heading = title or "timeline"
     if accuracy is not None:
         heading = f"{heading} | frame accuracy {accuracy:.3f}"
+        if filtered_accuracy is not None:
+            heading = f"{heading} -> {filtered_accuracy:.3f} filtered"
     if detection_rate is not None:
         heading = f"{heading} | detection {detection_rate:.2f}"
         if longest_gap:
