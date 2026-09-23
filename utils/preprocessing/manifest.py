@@ -17,6 +17,7 @@ class ManifestConfig:
     output_dir: str = "data/manifests"
     processed_dir: str = "data/processed"
     audit_path: str = "data/audit/quality_audit.csv"
+    dirty_data_path: str | None = None
     subject_splits_path: str = "data/manifests/subject_splits.json"
     seed: int = 42
     train_ratio: float = 0.7
@@ -44,6 +45,36 @@ def _validate_ratios(config: ManifestConfig) -> None:
     )
     if any(value <= 0 for value in ratios) or abs(sum(ratios) - 1.0) > 1e-9:
         raise ValueError("Manifest split ratios must be positive and sum to 1")
+
+
+def _load_dirty_video_ids(path: str | None) -> set[str]:
+    if path is None:
+        return set()
+    dirty_path = Path(path).expanduser()
+    if not dirty_path.is_file():
+        raise FileNotFoundError(f"Dirty-data list does not exist: {dirty_path}")
+
+    video_ids: set[str] = set()
+    invalid_lines: list[int] = []
+    for line_number, raw_line in enumerate(
+        dirty_path.read_text(encoding="utf-8-sig").splitlines(),
+        start=1,
+    ):
+        value = raw_line.strip()
+        if not value or value.startswith("#"):
+            continue
+        parts = [part.strip() for part in value.replace("\\", "/").split("/")]
+        if len(parts) < 2 or any(not part for part in parts):
+            invalid_lines.append(line_number)
+            continue
+        video_ids.add("__".join(parts))
+    if invalid_lines:
+        formatted = ", ".join(map(str, invalid_lines))
+        raise ValueError(
+            f"Invalid dirty-data entries at lines {formatted} in {dirty_path}; "
+            "expected source/sample-directory paths"
+        )
+    return video_ids
 
 
 def build_subject_splits(
@@ -112,13 +143,25 @@ def build_experiment_manifest(
     config: ManifestConfig,
     overwrite_subject_splits: bool = False,
 ) -> Path:
-    rows = [
+    audited_rows = [
         row
         for row in load_audit_rows(config.audit_path)
         if row["quality_passed"] and row.get("subject_id")
     ]
-    if not rows:
+    if not audited_rows:
         raise ValueError("Audit contains no quality-passed records with subject_id")
+    dirty_video_ids = _load_dirty_video_ids(config.dirty_data_path)
+    excluded_rows = [
+        row for row in audited_rows if str(row["video_id"]) in dirty_video_ids
+    ]
+    excluded_video_ids = sorted(
+        {str(row["video_id"]) for row in excluded_rows}
+    )
+    rows = [
+        row for row in audited_rows if str(row["video_id"]) not in dirty_video_ids
+    ]
+    if not rows:
+        raise ValueError("Dirty-data filter excluded all quality-passed records")
     subject_mapping = build_subject_splits(
         [str(row["subject_id"]) for row in rows],
         config,
@@ -193,6 +236,12 @@ def build_experiment_manifest(
                 },
                 "grouping": "subject",
                 "experiment": asdict(config),
+                "dirty_data": {
+                    "path": config.dirty_data_path,
+                    "listed_video_count": len(dirty_video_ids),
+                    "excluded_record_count": len(excluded_rows),
+                    "excluded_video_ids": excluded_video_ids,
+                },
                 "splits": split_paths,
                 "records": selected,
             },

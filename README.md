@@ -105,6 +105,11 @@ python prepare_data.py manifest
 可以用 `--sources data_lm data_sr data_vj` 只处理部分 source。`all` 默认运行
 inventory、extract、assemble、audit，但不会自动生成 stats 和 manifest。
 
+`manifest` 阶段会读取 `config_prepare.yaml` 中的 `manifest.dirty_data_path`，
+将清单里以 `source\样本目录` 或 `source/样本目录` 书写的脏样本从训练、验证和测试
+三个 split 中统一排除。更新 `dirty_data.txt` 后，需要在数据服务器上重新运行
+`python prepare_data.py manifest`，再开始训练、推理或评估。
+
 `stats` 只读 `data/processed` 下已装配的序列，所以统计的是 15 FPS 时间轴上、过完
 质量流程之后的构成，与 `data/inventory/summary.json`（原始标注、源 FPS、含下游会
 丢弃的样本）刻意区分。不带 `--sources` 时每个 source 一份报告；带 `--sources` 时

@@ -50,6 +50,7 @@ manifest:
   output_dir: data/manifests
   processed_dir: data/processed
   audit_path: data/audit/quality_audit.csv
+  dirty_data_path: dirty_data.txt
   subject_splits_path: data/manifests/subject_splits.json
   seed: 42
   train_ratio: 0.7
