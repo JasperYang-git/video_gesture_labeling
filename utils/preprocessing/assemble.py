@@ -20,9 +20,17 @@ from utils.preprocessing.features import (
     align_labels_to_target_fps,
     build_feature_matrix,
     center_hand_landmarks,
+    correct_aspect_ratio,
+    mirror_hand_landmarks,
 )
 from utils.preprocessing.pipeline import compute_quality_audit
-from utils.preprocessing.tracks import TrackConfig, load_track, track_cache_path
+from utils.preprocessing.tracks import (
+    LEFT_SIDE,
+    TrackConfig,
+    load_track,
+    probe_frame_size,
+    track_cache_path,
+)
 from utils.schema import BACKGROUND_ID, COORD_DIM, SequenceRecord, save_sequence
 
 
@@ -33,6 +41,8 @@ class AssembleConfig:
     one_euro_min_cutoff: float = 1.0
     one_euro_beta: float = 0.007
     one_euro_d_cutoff: float = 1.0
+    aspect_correction: bool = True
+    audit_edge_trim: float = 0.2
 
     def fingerprint(self) -> str:
         values = asdict(self)
@@ -57,11 +67,28 @@ def sequence_output_path(config: AssembleConfig, source: str, video_id: str) -> 
     )
 
 
+def _frame_aspect_ratio(
+    metadata: dict[str, Any],
+    video_path: str | Path,
+) -> float | None:
+    """Width / height of the decoded frames, from the track or by probing the video."""
+    width = metadata.get("frame_width")
+    height = metadata.get("frame_height")
+    if not width or not height:
+        probed = probe_frame_size(video_path)
+        if probed is None:
+            return None
+        width, height = probed
+    return float(width) / float(height)
+
+
 def _prepare_source_tracks(
     landmarks: np.ndarray,
     valid_mask: np.ndarray,
     source_fps: float,
     config: AssembleConfig,
+    hand_side: np.ndarray | None = None,
+    aspect_ratio: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     coordinates = np.zeros((len(landmarks), COORD_DIM), dtype=np.float32)
     palms = np.ones(len(landmarks), dtype=np.float32)
@@ -85,6 +112,10 @@ def _prepare_source_tracks(
             coordinates[index] = last_coordinates
             palms[index] = last_palm
             continue
+        if hand_side is not None and hand_side[index] == LEFT_SIDE:
+            points = mirror_hand_landmarks(points)
+        if aspect_ratio != 1.0:
+            points = correct_aspect_ratio(points, aspect_ratio)
         centered, palm = center_hand_landmarks(points)
         last_coordinates = coordinate_filter(centered, dt)
         last_palm = float(
@@ -155,11 +186,25 @@ def assemble_entry(
                 "error": "Negative scene contains non-background annotation labels",
             }
 
+    aspect_ratio = (
+        _frame_aspect_ratio(track["metadata"], entry.video_path)
+        if config.aspect_correction
+        else None
+    )
+    if config.aspect_correction and aspect_ratio is None:
+        print(f"Warning: {entry.video_id}: frame size unknown, aspect correction skipped")
+    hand_side = track["hand_side"]
     coordinates, palms = _prepare_source_tracks(
         track["landmarks"],
         track["valid_mask"],
         source_fps,
         config,
+        hand_side=hand_side,
+        aspect_ratio=aspect_ratio or 1.0,
+    )
+    tracked = hand_side != 0
+    left_hand_ratio = (
+        float(np.mean(hand_side[tracked] == LEFT_SIDE)) if tracked.any() else 0.0
     )
     normalized, quality, mask = aggregate_hand_tracks(
         coordinates,
@@ -186,7 +231,14 @@ def assemble_entry(
         track["valid_mask"],
         source_labels,
         source_fps,
+        edge_trim=config.audit_edge_trim,
     )
+    if left_hand_ratio == 0.0:
+        record_hand_side = "physical_right"
+    elif left_hand_ratio == 1.0:
+        record_hand_side = "physical_left_mirrored"
+    else:
+        record_hand_side = "mixed_mirrored"
     record = SequenceRecord(
         features=features,
         labels=labels,
@@ -194,7 +246,7 @@ def assemble_entry(
         video_id=entry.video_id,
         fps=config.target_fps,
         source_path=str(entry.video_path),
-        hand_side="physical_right",
+        hand_side=record_hand_side,
         subject_id=entry.subject_id,
         session_id="",
         source=entry.source,
@@ -221,6 +273,9 @@ def assemble_entry(
             "preprocess_config_fingerprint": config.fingerprint(),
             "preprocess_fingerprint": combined_fingerprint,
             "annotation_sha256": annotation_sha,
+            "left_hand_ratio": left_hand_ratio,
+            "aspect_ratio": aspect_ratio if aspect_ratio is not None else 1.0,
+            "aspect_corrected": aspect_ratio is not None,
             **audit,
         },
     )

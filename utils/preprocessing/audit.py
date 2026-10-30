@@ -55,10 +55,14 @@ def audit_inventory(
         min_class_rate = float(
             metadata.get("min_class_detection_rate", detection_rate)
         )
+        core_rate = float(metadata.get("core_detection_rate", detection_rate))
+        min_class_core_rate = float(
+            metadata.get("min_class_core_detection_rate", min_class_rate)
+        )
         scene_valid = entry.polarity != "unknown"
         passed = (
-            detection_rate >= config.quality_threshold
-            and min_class_rate >= config.min_class_detection_threshold
+            core_rate >= config.quality_threshold
+            and min_class_core_rate >= config.min_class_detection_threshold
             and (scene_valid or not config.exclude_unknown_scenes)
         )
         rows.append(
@@ -83,6 +87,11 @@ def audit_inventory(
                 "detection_rate": detection_rate,
                 "min_class_id": metadata.get("min_class_id", ""),
                 "min_class_detection_rate": min_class_rate,
+                "core_detection_rate": core_rate,
+                "min_class_core_id": metadata.get("min_class_core_id", ""),
+                "min_class_core_detection_rate": min_class_core_rate,
+                "left_hand_ratio": metadata.get("left_hand_ratio", ""),
+                "aspect_ratio": metadata.get("aspect_ratio", ""),
                 "longest_missing_seconds": metadata.get(
                     "longest_missing_seconds", ""
                 ),

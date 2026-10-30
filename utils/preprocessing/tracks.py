@@ -25,8 +25,8 @@ class TrackConfig:
     cache_dir: str = "data/cache/tracks"
 
     def __post_init__(self) -> None:
-        if self.physical_hand.lower() not in {"left", "right"}:
-            raise ValueError("physical_hand must be left or right")
+        if self.physical_hand.lower() not in {"left", "right", "auto"}:
+            raise ValueError("physical_hand must be left, right or auto")
         if self.allow_opposite_hand_fallback:
             raise ValueError(
                 "Opposite-hand fallback is forbidden for the strict-hand feature schema"
@@ -55,35 +55,76 @@ def mediapipe_label_for_physical_hand(
     return "Left" if hand == "right" else "Right"
 
 
-def select_strict_hand(
+RIGHT_SIDE = 1
+LEFT_SIDE = -1
+NO_HAND = 0
+
+
+def _confident_hands(
     result: Any,
     config: TrackConfig,
-) -> tuple[np.ndarray, float] | None:
+) -> list[tuple[np.ndarray, float, int]]:
+    """Every hand above the handedness threshold as (points, score, physical side)."""
     if result.multi_hand_landmarks is None or result.multi_handedness is None:
-        return None
-    expected_label = mediapipe_label_for_physical_hand(
-        config.physical_hand, config.input_mirrored
-    )
-    selected: tuple[np.ndarray, float] | None = None
-    best_score = -1.0
+        return []
+    right_label = mediapipe_label_for_physical_hand("right", config.input_mirrored)
+    hands: list[tuple[np.ndarray, float, int]] = []
     for landmarks, handedness in zip(
         result.multi_hand_landmarks, result.multi_handedness
     ):
         classification = handedness.classification[0]
-        label = str(classification.label)
         score = float(classification.score)
-        if label != expected_label or score < config.handedness_threshold:
+        if score < config.handedness_threshold:
             continue
-        if score > best_score:
-            selected = (
-                np.asarray(
-                    [[point.x, point.y, point.z] for point in landmarks.landmark],
-                    dtype=np.float32,
-                ),
-                score,
-            )
-            best_score = score
-    return selected
+        side = RIGHT_SIDE if str(classification.label) == right_label else LEFT_SIDE
+        points = np.asarray(
+            [[point.x, point.y, point.z] for point in landmarks.landmark],
+            dtype=np.float32,
+        )
+        hands.append((points, score, side))
+    return hands
+
+
+def select_strict_hand(
+    result: Any,
+    config: TrackConfig,
+) -> tuple[np.ndarray, float] | None:
+    expected_side = RIGHT_SIDE if config.physical_hand.lower() == "right" else LEFT_SIDE
+    candidates = [
+        (points, score)
+        for points, score, side in _confident_hands(result, config)
+        if side == expected_side
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[1])
+
+
+def select_auto_hand(
+    result: Any,
+    config: TrackConfig,
+    previous_side: int = NO_HAND,
+) -> tuple[np.ndarray, float, int] | None:
+    """Pick either hand, sticking to the previous frame's side while it stays visible."""
+    hands = _confident_hands(result, config)
+    if not hands:
+        return None
+    same_side = [hand for hand in hands if hand[2] == previous_side]
+    return max(same_side or hands, key=lambda item: item[1])
+
+
+def select_hand(
+    result: Any,
+    config: TrackConfig,
+    previous_side: int = NO_HAND,
+) -> tuple[np.ndarray, float, int] | None:
+    if config.physical_hand.lower() == "auto":
+        return select_auto_hand(result, config, previous_side)
+    selected = select_strict_hand(result, config)
+    if selected is None:
+        return None
+    side = RIGHT_SIDE if config.physical_hand.lower() == "right" else LEFT_SIDE
+    return selected[0], selected[1], side
 
 
 def _optional_dependencies():
@@ -121,10 +162,34 @@ def track_cache_path(config: TrackConfig, source: str, video_id: str) -> Path:
     )
 
 
+def probe_frame_size(video_path: str | Path) -> tuple[int, int] | None:
+    """Decoded (width, height) of the first frame, or None when it cannot be read.
+
+    The decoded frame is used instead of CAP_PROP_FRAME_WIDTH because phone videos
+    carry a rotation tag that OpenCV applies when decoding but not to the properties.
+    """
+    try:
+        import cv2
+    except ImportError:
+        return None
+    capture = cv2.VideoCapture(str(Path(video_path).expanduser()))
+    try:
+        if not capture.isOpened():
+            return None
+        ok, frame = capture.read()
+        if not ok or frame is None:
+            return None
+        height, width = frame.shape[:2]
+        return int(width), int(height)
+    finally:
+        capture.release()
+
+
 def extract_track(
     video_path: str | Path,
     config: TrackConfig,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, np.ndarray, tuple[int, int] | None]:
+    """Return landmarks, quality, valid mask, fps, per-frame hand side and frame size."""
     cv2, mp = _optional_dependencies()
     capture = cv2.VideoCapture(str(Path(video_path).expanduser()))
     if not capture.isOpened():
@@ -136,6 +201,9 @@ def extract_track(
     landmarks: list[np.ndarray] = []
     quality: list[float] = []
     valid_mask: list[float] = []
+    hand_side: list[int] = []
+    frame_size: tuple[int, int] | None = None
+    previous_side = NO_HAND
     with mp.solutions.hands.Hands(
         static_image_mode=False,
         max_num_hands=config.max_num_hands,
@@ -147,18 +215,24 @@ def extract_track(
             ok, frame = capture.read()
             if not ok:
                 break
+            if frame_size is None:
+                height, width = frame.shape[:2]
+                frame_size = (int(width), int(height))
             frame.flags.writeable = False
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            selected = select_strict_hand(hands.process(rgb), config)
+            selected = select_hand(hands.process(rgb), config, previous_side)
             if selected is None:
                 landmarks.append(np.full((21, 3), np.nan, dtype=np.float32))
                 quality.append(0.0)
                 valid_mask.append(0.0)
+                hand_side.append(NO_HAND)
             else:
-                points, score = selected
+                points, score, side = selected
                 landmarks.append(points)
                 quality.append(score)
                 valid_mask.append(1.0)
+                hand_side.append(side)
+                previous_side = side
     capture.release()
     if not landmarks:
         raise ValueError(f"No frames decoded from {video_path}")
@@ -167,6 +241,8 @@ def extract_track(
         np.asarray(quality, dtype=np.float32),
         np.asarray(valid_mask, dtype=np.float32),
         source_fps,
+        np.asarray(hand_side, dtype=np.int8),
+        frame_size,
     )
 
 
@@ -177,32 +253,49 @@ def save_track(
     valid_mask: np.ndarray,
     source_fps: float,
     metadata: dict[str, Any],
+    hand_side: np.ndarray | None = None,
 ) -> Path:
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{output.name}.tmp.npz")
-    np.savez_compressed(
-        temporary,
-        landmarks=np.asarray(landmarks, dtype=np.float32),
-        tracking_quality=np.asarray(quality, dtype=np.float32),
-        valid_mask=np.asarray(valid_mask, dtype=np.float32),
-        source_fps=np.asarray(source_fps, dtype=np.float32),
-        metadata_json=np.asarray(json.dumps(metadata, ensure_ascii=False)),
-    )
+    arrays: dict[str, np.ndarray] = {
+        "landmarks": np.asarray(landmarks, dtype=np.float32),
+        "tracking_quality": np.asarray(quality, dtype=np.float32),
+        "valid_mask": np.asarray(valid_mask, dtype=np.float32),
+        "source_fps": np.asarray(source_fps, dtype=np.float32),
+        "metadata_json": np.asarray(json.dumps(metadata, ensure_ascii=False)),
+    }
+    if hand_side is not None:
+        arrays["hand_side"] = np.asarray(hand_side, dtype=np.int8)
+    np.savez_compressed(temporary, **arrays)
     temporary.replace(output)
     return output
 
 
+def _default_hand_side(valid_mask: np.ndarray, metadata: dict[str, Any]) -> np.ndarray:
+    """Hand side for tracks cached before it was recorded: always the strict hand."""
+    side = LEFT_SIDE if str(metadata.get("physical_hand", "right")).lower() == "left" else RIGHT_SIDE
+    return np.where(valid_mask > 0.5, side, NO_HAND).astype(np.int8)
+
+
 def load_track(path: str | Path) -> dict[str, Any]:
     with np.load(path, allow_pickle=False) as archive:
+        valid_mask = np.asarray(archive["valid_mask"], dtype=np.float32)
+        metadata = json.loads(str(archive["metadata_json"].item()))
+        hand_side = (
+            np.asarray(archive["hand_side"], dtype=np.int8)
+            if "hand_side" in archive.files
+            else _default_hand_side(valid_mask, metadata)
+        )
         return {
             "landmarks": np.asarray(archive["landmarks"], dtype=np.float32),
             "tracking_quality": np.asarray(
                 archive["tracking_quality"], dtype=np.float32
             ),
-            "valid_mask": np.asarray(archive["valid_mask"], dtype=np.float32),
+            "valid_mask": valid_mask,
+            "hand_side": hand_side,
             "source_fps": float(archive["source_fps"]),
-            "metadata": json.loads(str(archive["metadata_json"].item())),
+            "metadata": metadata,
         }
 
 
@@ -221,28 +314,36 @@ def extract_inventory_entry(entry: Any, config: TrackConfig, resume: bool = True
                 "status": "cached",
                 "track_path": str(output),
             }
-    landmarks, quality, valid_mask, source_fps = extract_track(
+    landmarks, quality, valid_mask, source_fps, hand_side, frame_size = extract_track(
         entry.video_path, config
     )
+    metadata: dict[str, Any] = {
+        "video_id": entry.video_id,
+        "source": entry.source,
+        "video_path": str(entry.video_path),
+        "physical_hand": config.physical_hand,
+        "input_mirrored": config.input_mirrored,
+        "mediapipe_label": (
+            "any"
+            if config.physical_hand.lower() == "auto"
+            else mediapipe_label_for_physical_hand(
+                config.physical_hand, config.input_mirrored
+            )
+        ),
+        "track_config_fingerprint": config.fingerprint(),
+        "track_fingerprint": fingerprint,
+        "video_signature": video_signature(entry.video_path),
+    }
+    if frame_size is not None:
+        metadata["frame_width"], metadata["frame_height"] = frame_size
     save_track(
         output,
         landmarks,
         quality,
         valid_mask,
         source_fps,
-        {
-            "video_id": entry.video_id,
-            "source": entry.source,
-            "video_path": str(entry.video_path),
-            "physical_hand": config.physical_hand,
-            "input_mirrored": config.input_mirrored,
-            "mediapipe_label": mediapipe_label_for_physical_hand(
-                config.physical_hand, config.input_mirrored
-            ),
-            "track_config_fingerprint": config.fingerprint(),
-            "track_fingerprint": fingerprint,
-            "video_signature": video_signature(entry.video_path),
-        },
+        metadata,
+        hand_side=hand_side,
     )
     return {
         "video_id": entry.video_id,
@@ -373,11 +474,12 @@ def write_handedness_previews(
             ok, frame = capture.read()
             if not ok:
                 continue
-            selected = select_strict_hand(
+            selected = select_hand(
                 hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)), config
             )
             if selected is not None:
-                points, score = selected
+                points, score, side = selected
+                side_name = "right" if side == RIGHT_SIDE else "left"
                 height, width = frame.shape[:2]
                 for x, y, _ in points:
                     cv2.circle(
@@ -389,7 +491,7 @@ def write_handedness_previews(
                     )
                 cv2.putText(
                     frame,
-                    f"physical {config.physical_hand} score={score:.3f}",
+                    f"physical {side_name} score={score:.3f}",
                     (20, 35),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.8,

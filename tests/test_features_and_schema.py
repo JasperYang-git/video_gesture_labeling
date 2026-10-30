@@ -10,7 +10,9 @@ from utils.preprocessing.features import (
     OneEuroFilter,
     align_labels_to_target_fps,
     build_feature_matrix,
+    correct_aspect_ratio,
     downsample_sequence,
+    mirror_hand_landmarks,
     normalize_hand_landmarks,
     palm_size,
 )
@@ -94,6 +96,53 @@ class FeatureSchemaTests(unittest.TestCase):
         normalized = normalize_hand_landmarks(landmarks).reshape(21, 3)
         np.testing.assert_allclose(normalized[0], 0.0, atol=1e-6)
         self.assertGreater(palm_size(landmarks), 0.0)
+
+    def make_palm(self) -> np.ndarray:
+        """A flat right hand in pixel-like units: MCPs fanned out above the wrist."""
+        landmarks = np.zeros((21, 3), dtype=np.float32)
+        landmarks[5] = [-0.3, -0.9, 0.0]
+        landmarks[9] = [0.0, -1.0, 0.0]
+        landmarks[13] = [0.25, -0.95, 0.0]
+        landmarks[17] = [0.5, -0.8, 0.0]
+        return landmarks
+
+    def test_palm_size_averages_the_four_metacarpals(self) -> None:
+        landmarks = self.make_palm()
+        expected = np.mean(
+            [np.linalg.norm(landmarks[index]) for index in (5, 9, 13, 17)]
+        )
+        self.assertAlmostEqual(palm_size(landmarks), float(expected), places=6)
+
+    def test_aspect_correction_makes_palm_size_rotation_invariant(self) -> None:
+        width, height = 1920.0, 1080.0
+        hand = self.make_palm() * 100.0 + np.array([900.0, 500.0, 0.0])
+        rotation = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+        center = hand[0]
+        rotated = (hand - center) @ rotation.T + center
+
+        def to_mediapipe(points: np.ndarray) -> np.ndarray:
+            normalized = points.copy()
+            normalized[:, 0] /= width
+            normalized[:, 1] /= height
+            normalized[:, 2] /= width
+            return normalized.astype(np.float32)
+
+        upright = to_mediapipe(hand)
+        turned = to_mediapipe(rotated)
+        self.assertNotAlmostEqual(palm_size(upright), palm_size(turned), places=3)
+        aspect = width / height
+        self.assertAlmostEqual(
+            palm_size(correct_aspect_ratio(upright, aspect)),
+            palm_size(correct_aspect_ratio(turned, aspect)),
+            places=5,
+        )
+
+    def test_mirroring_negates_wrist_centred_x(self) -> None:
+        hand = self.make_palm() * 0.1 + np.array([0.3, 0.6, 0.0], dtype=np.float32)
+        original = normalize_hand_landmarks(hand).reshape(21, 3)
+        mirrored = normalize_hand_landmarks(mirror_hand_landmarks(hand)).reshape(21, 3)
+        np.testing.assert_allclose(mirrored[:, 0], -original[:, 0], atol=1e-5)
+        np.testing.assert_allclose(mirrored[:, 1:], original[:, 1:], atol=1e-5)
 
     def test_one_euro_filter_is_stable_and_finite(self) -> None:
         smoother = OneEuroFilter(3, min_cutoff=1.0, beta=0.01)

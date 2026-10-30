@@ -61,6 +61,7 @@ QUALITY_KEYS = (
     "palm_outlier_rate",
     "trajectory_jump_rate",
     "trajectory_jump_reliable",
+    "left_hand_ratio",
 )
 
 
@@ -162,6 +163,7 @@ def write_quality_report(path: Path, rows: list[dict[str, Any]]) -> Path:
         "palm_outlier_rate",
         "trajectory_jump_rate",
         "trajectory_jump_reliable",
+        "left_hand_ratio",
         "video_path",
     ]
     ordered = sorted(rows, key=lambda row: float(row.get("detection_rate") or 0.0))

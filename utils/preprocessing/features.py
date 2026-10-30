@@ -13,6 +13,8 @@ from utils.schema import (
 
 WRIST_INDEX = 0
 MIDDLE_MCP_INDEX = 9
+PALM_MCP_INDICES = (5, 9, 13, 17)
+X_CHANNELS = np.arange(0, COORD_DIM, 3)
 
 
 class OneEuroFilter:
@@ -86,11 +88,37 @@ def center_hand_landmarks(landmarks: np.ndarray) -> tuple[np.ndarray, float]:
 
 
 def palm_size(landmarks: np.ndarray) -> float:
+    """Mean 3-D wrist-to-MCP length over four metacarpals.
+
+    A single bone shortens sharply when the palm tilts toward the camera; averaging
+    four of them in 3-D keeps the scale close to constant for a fixed hand distance.
+    """
     points = np.asarray(landmarks, dtype=np.float32).reshape(21, 3)
     wrist = points[WRIST_INDEX]
-    middle_mcp = points[MIDDLE_MCP_INDEX]
-    scale = float(np.linalg.norm(middle_mcp - wrist))
+    bones = points[list(PALM_MCP_INDICES)] - wrist
+    scale = float(np.linalg.norm(bones, axis=1).mean())
     return max(scale, 1e-3)
+
+
+def correct_aspect_ratio(landmarks: np.ndarray, aspect_ratio: float) -> np.ndarray:
+    """Rescale MediaPipe image-normalised x and z into units of image height.
+
+    MediaPipe divides x by the frame width and y by the frame height, and z shares
+    the scale of x, so on a non-square frame the axes have different units.
+    """
+    if aspect_ratio <= 0:
+        raise ValueError("aspect_ratio must be positive")
+    points = np.asarray(landmarks, dtype=np.float32).reshape(21, 3).copy()
+    points[:, 0] *= aspect_ratio
+    points[:, 2] *= aspect_ratio
+    return points
+
+
+def mirror_hand_landmarks(landmarks: np.ndarray) -> np.ndarray:
+    """Horizontally mirror image-normalised landmarks, turning a left hand into a right one."""
+    points = np.asarray(landmarks, dtype=np.float32).reshape(21, 3).copy()
+    points[:, 0] = 1.0 - points[:, 0]
+    return points
 
 
 def normalize_hand_landmarks(landmarks: np.ndarray) -> np.ndarray:

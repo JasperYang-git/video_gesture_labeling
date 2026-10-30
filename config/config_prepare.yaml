@@ -29,6 +29,11 @@ assemble:
   one_euro_min_cutoff: 1.0
   one_euro_beta: 0.007
   one_euro_d_cutoff: 1.0
+  # Rescale MediaPipe x/z by width/height so all axes share one unit.
+  aspect_correction: true
+  # Fraction trimmed from both ends of every action segment before computing
+  # core_detection_rate; hands are often raised into / lowered out of view there.
+  audit_edge_trim: 0.2
   status_path: data/inventory/assemble_status.jsonl
 
 audit:

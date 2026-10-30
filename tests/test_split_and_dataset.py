@@ -8,7 +8,14 @@ import numpy as np
 
 from utils.data_loader import GestureWindowDataset, build_train_loaders
 from utils.mock_data import generate_mock_sequence
-from utils.schema import BACKGROUND_ID, IGNORE_INDEX, save_sequence
+from utils.preprocessing.features import X_CHANNELS
+from utils.schema import (
+    BACKGROUND_ID,
+    COORD_SLICE,
+    IGNORE_INDEX,
+    VELOCITY_SLICE,
+    save_sequence,
+)
 from utils.split import load_manifest, split_video_files, write_manifest
 
 
@@ -82,6 +89,21 @@ class SplitAndDatasetTests(unittest.TestCase):
         labels = dataset[0]["labels"].numpy()
         self.assertEqual(labels.shape[0], 16)
         self.assertTrue(np.all(labels[10:] == IGNORE_INDEX))
+
+    def test_mirror_augmentation_negates_only_x_channels(self) -> None:
+        record = generate_mock_sequence("mirror", 40, 15.0, seed=5)
+        kwargs = {"window_size": 20, "stride": 20, "keep_background_prob": 1.0, "seed": 0}
+        plain = GestureWindowDataset([record], **kwargs)[0]["features"].numpy()
+        mirrored = GestureWindowDataset([record], mirror_prob=1.0, **kwargs)[0][
+            "features"
+        ].numpy()
+        x_rows = np.concatenate(
+            [COORD_SLICE.start + X_CHANNELS, VELOCITY_SLICE.start + X_CHANNELS]
+        )
+        other_rows = np.setdiff1d(np.arange(plain.shape[0]), x_rows)
+        np.testing.assert_allclose(mirrored[x_rows], -plain[x_rows])
+        np.testing.assert_allclose(mirrored[other_rows], plain[other_rows])
+        self.assertEqual(len(x_rows), 42)
 
     def test_build_train_loaders_from_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

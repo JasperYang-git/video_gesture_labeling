@@ -10,6 +10,7 @@ import numpy as np
 from utils.preprocessing.assemble import AssembleConfig, assemble_entry
 from utils.preprocessing.tracks import (
     TrackConfig,
+    load_track,
     save_track,
     track_cache_path,
 )
@@ -69,6 +70,89 @@ class StagedAssembleTests(unittest.TestCase):
             self.assertEqual(record.subject_id, "LMVibra006")
             self.assertEqual(record.source, "data_lm")
             self.assertEqual(record.features.shape, (128, 15))
+
+    def save_hand_track(
+        self,
+        entry,
+        config: TrackConfig,
+        landmarks: np.ndarray,
+        hand_side: np.ndarray,
+    ) -> None:
+        frames = len(landmarks)
+        save_track(
+            track_cache_path(config, entry.source, entry.video_id),
+            landmarks,
+            np.ones(frames, dtype=np.float32),
+            np.ones(frames, dtype=np.float32),
+            30.0,
+            {
+                "track_fingerprint": f"track-{entry.video_id}",
+                "track_config_fingerprint": config.fingerprint(),
+                "frame_width": 1920,
+                "frame_height": 1080,
+            },
+            hand_side=hand_side,
+        )
+
+    def test_mirrored_left_hand_matches_the_right_hand(self) -> None:
+        rng = np.random.default_rng(0)
+        frames = 30
+        right = (0.4 + 0.1 * rng.random((frames, 21, 3))).astype(np.float32)
+        left = right.copy()
+        left[:, :, 0] = 1.0 - left[:, :, 0]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            track_config = TrackConfig(
+                physical_hand="auto", cache_dir=str(root / "tracks")
+            )
+            assemble_config = AssembleConfig(output_dir=str(root / "processed"))
+            records = {}
+            for name, landmarks, side in (
+                ("right", right, 1),
+                ("left", left, -1),
+            ):
+                folder = root / name
+                folder.mkdir()
+                entry = self.make_entry(folder, "positive", "0;0.5;0;1;\n")
+                entry.video_id = f"data_lm__{name}"
+                self.save_hand_track(
+                    entry,
+                    track_config,
+                    landmarks,
+                    np.full(frames, side, dtype=np.int8),
+                )
+                result = assemble_entry(entry, track_config, assemble_config)
+                self.assertEqual(result["status"], "completed")
+                records[name] = load_sequence(result["sequence_path"])
+
+            np.testing.assert_allclose(
+                records["left"].features, records["right"].features, atol=1e-4
+            )
+            self.assertEqual(records["left"].metadata["left_hand_ratio"], 1.0)
+            self.assertEqual(records["right"].metadata["left_hand_ratio"], 0.0)
+            self.assertAlmostEqual(
+                float(records["right"].metadata["aspect_ratio"]), 1920 / 1080
+            )
+            self.assertTrue(bool(records["right"].metadata["aspect_corrected"]))
+
+    def test_legacy_track_without_side_or_frame_size_still_assembles(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            entry = self.make_entry(root, "positive", "0;0.5;0;1;\n")
+            track_config = TrackConfig(cache_dir=str(root / "tracks"))
+            self.save_fake_track(entry, track_config)
+            track = load_track(track_cache_path(track_config, entry.source, entry.video_id))
+            np.testing.assert_array_equal(track["hand_side"], np.ones(30, dtype=np.int8))
+            result = assemble_entry(
+                entry,
+                track_config,
+                AssembleConfig(output_dir=str(root / "processed")),
+            )
+            self.assertEqual(result["status"], "completed")
+            record = load_sequence(result["sequence_path"])
+            self.assertEqual(record.hand_side, "physical_right")
+            self.assertFalse(bool(record.metadata["aspect_corrected"]))
+            self.assertIn("core_detection_rate", record.metadata)
 
     def test_negative_scene_rejects_action_annotation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

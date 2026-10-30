@@ -10,7 +10,9 @@ video_root: videos
 # check in utils/inference.py rejects the sequences.
 extract:
   num_workers: 4
-  physical_hand: right
+  # auto: track whichever hand is visible; left-hand frames are mirrored into the
+  # right-hand frame the model was trained on.
+  physical_hand: auto
   input_mirrored: false
   allow_opposite_hand_fallback: false
   handedness_threshold: 0.7
@@ -26,6 +28,8 @@ assemble:
   one_euro_min_cutoff: 1.0
   one_euro_beta: 0.007
   one_euro_d_cutoff: 1.0
+  aspect_correction: true
+  audit_edge_trim: 0.2
 
 inference:
   model_path: outputs/best_model.pth

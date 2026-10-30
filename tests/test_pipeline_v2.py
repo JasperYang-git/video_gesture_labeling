@@ -15,6 +15,7 @@ from utils.preprocessing.features import (
 )
 from utils.preprocessing.pipeline import (
     PreprocessConfig,
+    action_core_mask,
     compute_quality_audit,
     process_raw_videos,
     source_fingerprint,
@@ -75,6 +76,31 @@ class PipelineV2Tests(unittest.TestCase):
         self.assertAlmostEqual(audit["per_class_detection_rate"]["0"], 0.5)
         self.assertEqual(audit["min_class_id"], "0")
         self.assertEqual(audit["longest_missing_frames"], 1)
+
+    def test_core_detection_rate_ignores_raise_and_lower_edges(self) -> None:
+        labels = np.full(40, BACKGROUND_ID)
+        labels[10:30] = 2
+        valid = np.zeros(40, dtype=np.float32)
+        valid[15:25] = 1.0  # hand only visible in the middle of the gesture
+        audit = compute_quality_audit(
+            np.zeros((40, COORD_DIM), dtype=np.float32),
+            np.ones(40, dtype=np.float32),
+            valid,
+            labels,
+            fps=30.0,
+            edge_trim=0.25,
+        )
+        self.assertAlmostEqual(audit["detection_rate"], 0.5)
+        self.assertAlmostEqual(audit["core_detection_rate"], 1.0)
+        self.assertAlmostEqual(audit["per_class_core_detection_rate"]["2"], 1.0)
+        self.assertAlmostEqual(audit["min_class_core_detection_rate"], 1.0)
+
+    def test_action_core_keeps_middle_frame_of_short_segments(self) -> None:
+        labels = np.asarray([BACKGROUND_ID, 3, BACKGROUND_ID, 4, 4, 4, BACKGROUND_ID])
+        core = action_core_mask(labels, edge_trim=0.45)
+        self.assertEqual(
+            core.tolist(), [False, True, False, False, True, False, False]
+        )
 
     def make_moving_track(
         self,

@@ -6,9 +6,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from utils.preprocessing.tracks import (
+    LEFT_SIDE,
+    NO_HAND,
+    RIGHT_SIDE,
     TrackConfig,
     extract_inventory,
     mediapipe_label_for_physical_hand,
+    select_auto_hand,
+    select_hand,
     select_strict_hand,
 )
 
@@ -67,6 +72,42 @@ class StrictRightTrackTests(unittest.TestCase):
                 TrackConfig(physical_hand="right", input_mirrored=False),
             )
         )
+
+    def test_auto_mode_selects_a_lone_left_hand(self) -> None:
+        # Non-mirrored input: MediaPipe calls the physical left hand "Right".
+        left_points, left_handedness = fake_hand("Right", 0.9, 0.7)
+        result = SimpleNamespace(
+            multi_hand_landmarks=[left_points],
+            multi_handedness=[left_handedness],
+        )
+        config = TrackConfig(physical_hand="auto", input_mirrored=False)
+        selected = select_hand(result, config)
+        self.assertIsNotNone(selected)
+        points, score, side = selected
+        self.assertEqual(side, LEFT_SIDE)
+        self.assertAlmostEqual(float(points[0, 0]), 0.7)
+        self.assertIsNone(select_strict_hand(result, TrackConfig(physical_hand="right")))
+
+    def test_auto_mode_sticks_to_the_previous_side(self) -> None:
+        right_points, right_handedness = fake_hand("Left", 0.75, 0.2)
+        left_points, left_handedness = fake_hand("Right", 0.95, 0.8)
+        result = SimpleNamespace(
+            multi_hand_landmarks=[right_points, left_points],
+            multi_handedness=[right_handedness, left_handedness],
+        )
+        config = TrackConfig(physical_hand="auto", input_mirrored=False)
+        self.assertEqual(select_auto_hand(result, config, NO_HAND)[2], LEFT_SIDE)
+        self.assertEqual(select_auto_hand(result, config, RIGHT_SIDE)[2], RIGHT_SIDE)
+        self.assertEqual(select_auto_hand(result, config, LEFT_SIDE)[2], LEFT_SIDE)
+
+    def test_strict_mode_reports_its_own_side(self) -> None:
+        right_points, right_handedness = fake_hand("Left", 0.9, 0.2)
+        result = SimpleNamespace(
+            multi_hand_landmarks=[right_points],
+            multi_handedness=[right_handedness],
+        )
+        selected = select_hand(result, TrackConfig(physical_hand="right"), LEFT_SIDE)
+        self.assertEqual(selected[2], RIGHT_SIDE)
 
     def test_opposite_fallback_cannot_be_enabled(self) -> None:
         with self.assertRaisesRegex(ValueError, "forbidden"):

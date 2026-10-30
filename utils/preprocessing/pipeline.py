@@ -288,32 +288,71 @@ def _trajectory_jump_rate(
     return float((deltas > threshold).mean()), True
 
 
+def action_core_mask(labels: np.ndarray, edge_trim: float) -> np.ndarray:
+    """Action frames without the first and last ``edge_trim`` of every segment.
+
+    In dynamic recordings the hand is raised into view at the start of a gesture and
+    lowered out of view at the end, so the segment edges legitimately miss the hand.
+    Because ``edge_trim < 0.5`` at least one frame of every segment is kept.
+    """
+    if not 0.0 <= edge_trim < 0.5:
+        raise ValueError("edge_trim must be in [0, 0.5)")
+    labels = np.asarray(labels)
+    core = np.zeros(len(labels), dtype=bool)
+    start = 0
+    while start < len(labels):
+        end = start
+        while end < len(labels) and labels[end] == labels[start]:
+            end += 1
+        if labels[start] != BACKGROUND_ID:
+            trim = int(np.floor((end - start) * edge_trim))
+            core[start + trim : end - trim] = True
+        start = end
+    return core
+
+
+def _per_class_rates(mask: np.ndarray, labels: np.ndarray, selection: np.ndarray) -> dict[str, float]:
+    rates: dict[str, float] = {}
+    for class_id in range(NUM_CLASSES):
+        if class_id == BACKGROUND_ID:
+            continue
+        class_mask = (labels == class_id) & selection
+        if class_mask.any():
+            rates[str(class_id)] = float(mask[class_mask].mean())
+    return rates
+
+
 def compute_quality_audit(
     centered_coordinates: np.ndarray,
     palm_sizes: np.ndarray,
     valid_mask: np.ndarray,
     labels: np.ndarray | None,
     fps: float,
+    edge_trim: float = 0.2,
 ) -> dict[str, Any]:
     """Compute source-FPS quality metrics, with action-only detection rates."""
     mask = np.asarray(valid_mask, dtype=np.float32) > 0.5
     coords = np.asarray(centered_coordinates, dtype=np.float32)
     palms = np.asarray(palm_sizes, dtype=np.float32)
     action_mask = np.ones(len(mask), dtype=bool)
+    core_mask = np.ones(len(mask), dtype=bool)
     if labels is not None:
         action_mask = labels != BACKGROUND_ID
+        core_mask = action_core_mask(labels, edge_trim)
     detection_rate = float(mask[action_mask].mean()) if action_mask.any() else float(mask.mean())
+    core_detection_rate = float(mask[core_mask].mean()) if core_mask.any() else float(mask.mean())
 
     per_class: dict[str, float] = {}
+    per_class_core: dict[str, float] = {}
     if labels is not None:
-        for class_id in range(NUM_CLASSES):
-            if class_id == BACKGROUND_ID:
-                continue
-            class_mask = labels == class_id
-            if class_mask.any():
-                per_class[str(class_id)] = float(mask[class_mask].mean())
+        per_class = _per_class_rates(mask, labels, np.ones(len(mask), dtype=bool))
+        per_class_core = _per_class_rates(mask, labels, core_mask)
     min_class_id = min(per_class, key=per_class.get) if per_class else ""
     min_class_rate = per_class[min_class_id] if min_class_id else detection_rate
+    min_core_class_id = min(per_class_core, key=per_class_core.get) if per_class_core else ""
+    min_class_core_rate = (
+        per_class_core[min_core_class_id] if min_core_class_id else core_detection_rate
+    )
 
     longest_missing = 0
     current_missing = 0
@@ -337,6 +376,10 @@ def compute_quality_audit(
         "per_class_detection_rate": per_class,
         "min_class_id": min_class_id,
         "min_class_detection_rate": float(min_class_rate),
+        "core_detection_rate": core_detection_rate,
+        "per_class_core_detection_rate": per_class_core,
+        "min_class_core_id": min_core_class_id,
+        "min_class_core_detection_rate": float(min_class_core_rate),
         "longest_missing_frames": int(longest_missing),
         "longest_missing_seconds": float(longest_missing / fps),
         "palm_outlier_rate": palm_outlier_rate,
@@ -420,7 +463,7 @@ def process_raw_video(
             "preprocess_config_fingerprint": config.fingerprint(),
             "annotation_sha256": annotation_sha256,
             "video_signature": video_signature,
-            "quality_passed": audit["detection_rate"] >= config.quality_threshold,
+            "quality_passed": audit["core_detection_rate"] >= config.quality_threshold,
         },
     )
     save_sequence(cache_path, record)

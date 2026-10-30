@@ -10,6 +10,9 @@ data:
   keep_background_prob: 0.0
   hard_negative_ratio: 0.15
   hard_negative_max_windows_per_video: 20
+  # Probability of mirroring a training window (x -> -x), so the model also
+  # tolerates mirrored left-hand tracks and handedness misclassification.
+  mirror_prob: 0.5
   dynamic_action_windows: true
   action_windows_per_segment: 3
   num_workers: 0

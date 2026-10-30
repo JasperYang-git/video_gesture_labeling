@@ -9,10 +9,13 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+from utils.preprocessing.features import X_CHANNELS
 from utils.schema import (
     BACKGROUND_ID,
+    COORD_SLICE,
     FEATURE_DIM,
     IGNORE_INDEX,
+    VELOCITY_SLICE,
     SequenceRecord,
     load_sequence,
 )
@@ -44,9 +47,12 @@ class GestureWindowDataset(Dataset):
         action_windows_per_segment: int = 3,
         hard_negative_ratio: float = 0.15,
         hard_negative_max_windows_per_video: int = 20,
+        mirror_prob: float = 0.0,
     ) -> None:
         if window_size <= 0 or stride <= 0:
             raise ValueError("window_size and stride must be positive")
+        if not 0.0 <= mirror_prob <= 1.0:
+            raise ValueError("mirror_prob must be in [0, 1]")
         if keep_background_prob is None:
             keep_background_prob = (
                 0.0 if keep_background_probability is None else keep_background_probability
@@ -70,6 +76,7 @@ class GestureWindowDataset(Dataset):
         self.hard_negative_max_windows_per_video = int(
             hard_negative_max_windows_per_video
         )
+        self.mirror_prob = float(mirror_prob)
         self.records = list(records)
         self.record_by_id = {record.video_id: record for record in self.records}
         self.windows: list[WindowSample] = []
@@ -155,6 +162,9 @@ class GestureWindowDataset(Dataset):
             sample.start,
             self.window_size,
         )
+        # torch's RNG, not numpy's, because DataLoader reseeds it in every worker.
+        if self.mirror_prob > 0.0 and float(torch.rand(())) < self.mirror_prob:
+            features = mirror_features(features)
         return {
             "features": torch.from_numpy(features),
             "labels": torch.from_numpy(labels),
@@ -174,6 +184,18 @@ class GestureWindowDataset(Dataset):
             window_labels = _padded_labels(record, sample.start, self.window_size)
             labels.extend(int(item) for item in window_labels if item != IGNORE_INDEX)
         return labels
+
+
+MIRROR_ROWS = np.concatenate(
+    [COORD_SLICE.start + X_CHANNELS, VELOCITY_SLICE.start + X_CHANNELS]
+)
+
+
+def mirror_features(features: np.ndarray) -> np.ndarray:
+    """Negate the x component of every coordinate and velocity: left hand <-> right hand."""
+    mirrored = features.copy()
+    mirrored[MIRROR_ROWS] *= -1.0
+    return mirrored
 
 
 def _windows_for_record(
@@ -364,6 +386,7 @@ def build_train_loaders(config: dict) -> tuple[DataLoader, DataLoader, list[Path
         hard_negative_max_windows_per_video=int(
             data_config.get("hard_negative_max_windows_per_video", 20)
         ),
+        mirror_prob=float(data_config.get("mirror_prob", 0.0)),
         **dataset_kwargs,
     )
     validation_dataset = GestureWindowDataset(
